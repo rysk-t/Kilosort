@@ -289,14 +289,17 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         logger.info('Generating drift plots ...')
         # st0 will be None if nblocks = 0 (no drift correction)
+        drift_plots = None
         if st0 is not None:
             if gui_sorter is not None:
                 gui_sorter.dshift = ops['dshift']
                 gui_sorter.st0 = st0
                 gui_sorter.plotDataReady.emit('drift')
             else:
-                kplots.plot_drift_amount(ops, results_dir, tmin=settings['tmin'])
-                kplots.plot_drift_scatter(st0, results_dir, tmin=settings['tmin'])
+                # Drawn in a separate process while sorting continues.
+                drift_plots = kplots.BackgroundDriftPlots(
+                    ops, st0, results_dir, tmin=settings['tmin']
+                    )
 
         # Sort spikes and save results
         st,tF, Wall0, clu0 = detect_spikes(
@@ -340,6 +343,8 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             gui_sorter.is_refractory = is_ref
             gui_sorter.plotDataReady.emit('probe')
         else:
+            if drift_plots is not None:
+                drift_plots.wait()
             kplots.plot_spike_positions(clu[kept_spikes], is_ref, results_dir)
         logger.info('Sorting finished.')
         log_sorting_summary(ops, log=logger, level='info')
