@@ -3,7 +3,7 @@ from numba.types import bool_
 import numpy as np
 import torch
 
-from kilosort.clustering_qr import xy_templates, get_data_cpu
+from kilosort.clustering_qr import xy_templates, get_data_cpu, _template_groups
 
 
 @njit("(int64[:], int32[:], int32)", cache=True)
@@ -108,6 +108,7 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
     csorted = spike_clusters[corder]
     starts = np.searchsorted(csorted, clusters, side='left')
     ends = np.searchsorted(csorted, clusters, side='right')
+    template_groups = _template_groups(spike_templates)
 
     for i, cs, ce in zip(clusters, starts, ends):
         # Get templates associated with cluster (often just 1)
@@ -119,7 +120,8 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
         # and the indices in tF where those spikes occur (igood).
         Xd, igood, ichan = get_data_cpu(
             ops, xy, iC, spike_templates, tF, None, None,
-            dmin=ops['dmin'], dminx=ops['dminx'], ix=ix, merge_dim=False
+            dmin=ops['dmin'], dminx=ops['dminx'], ix=ix, merge_dim=False,
+            _groups=template_groups
             )
 
         # Take mean of features across spikes, find channels w/ largest norm

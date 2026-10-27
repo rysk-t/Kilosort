@@ -1,6 +1,5 @@
 import gc
 import logging
-import weakref
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
@@ -543,12 +542,13 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     centers = [(jj, kk) for jj in range(len(xcent)) for kk in range(len(ycent))
                if kk + jj*ycent.size in nearest_center]
     iC_cpu = iC.cpu() if torch.is_tensor(iC) else iC
+    template_groups = _template_groups(iclust_template)
 
     def prepare_center(jj, kk):
         ix = (nearest_center == kk + jj*ycent.size)
         Xd, igood, ichan = get_data_cpu(
             ops, xy, iC_cpu, iclust_template, tF, ycent[kk], xcent[jj],
-            dmin=dmin, dminx=dminx, ix=ix,
+            dmin=dmin, dminx=dminx, ix=ix, _groups=template_groups,
             )
         kn = M = None
         if Xd is not None and Xd.shape[0] >= 1000:
@@ -687,32 +687,23 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     return clu, Wall
 
 
-_template_group_cache = {'ref': None, 'val': None}
-
-
 def _template_groups(PID):
     """Group spike indices by template with one stable argsort.
 
-    Returns (order, bounds) such that order[bounds[t]:bounds[t+1]] are the
-    spikes detected with template t, in ascending order. The result for the
-    most recent PID array is cached, since the same array is passed for
-    every clustering center.
+    The result is a snapshot: callers may reuse it while PID is unchanged.
+    Never cache by object identity, since PID may be mutated in place.
     """
-    cache = _template_group_cache
-    ref = cache['ref']
-    if ref is not None and ref() is PID and cache['val'][2] == PID.size:
-        return cache['val'][:2]
+    if torch.is_tensor(PID):
+        PID = PID.detach().cpu().numpy()
     nvals = int(PID.max()) + 1 if PID.size else 0
     order = np.argsort(PID, kind='stable')
     bounds = np.searchsorted(PID[order], np.arange(nvals + 1))
-    cache['ref'] = weakref.ref(PID)
-    cache['val'] = (order, bounds, PID.size)
     return order, bounds
 
 
 def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
-                 ix=None, merge_dim=True):
-    PID_np = PID
+                 ix=None, merge_dim=True, _groups=None):
+    PID_np = PID.detach().cpu().numpy() if torch.is_tensor(PID) else PID
 
     #iU = ops['iU'].cpu().numpy()
     #iC = ops['iCC'][:, ops['iU']]    
@@ -730,7 +721,7 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
             )
     # Same as ix[PID].nonzero()[:,0] (spikes from the selected templates, in
     # ascending order), without a pass over all spikes for every call.
-    order, bounds = _template_groups(PID_np)
+    order, bounds = _template_groups(PID_np) if _groups is None else _groups
     tids = ix.nonzero()[:,0].numpy()
     tids = tids[tids < len(bounds) - 1]
     if len(tids) == 0:
