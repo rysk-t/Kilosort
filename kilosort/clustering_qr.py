@@ -138,6 +138,7 @@ _N_EAGER = 2
 # handle alone does not keep its allocator pool alive after its last graph is
 # destroyed, and allocator blocks cannot be reused across capture streams.
 _graph_pools = {}
+_graph_cleanup_limits = {}
 _graph_pool_lock = Lock()
 
 
@@ -175,14 +176,31 @@ def _replay_graph(step, n, device):
         # Finish before releasing the previous graph or reusing its pool.
         torch.cuda.current_stream(device).synchronize()
         _graph_pools[device] = (g, capture_stream)
+        # WDDM may spill reserved blocks to system RAM before an allocation
+        # fails. Periodically discard fragmented pools before that happens.
+        base_limit = min(4 * 2**30, int(torch.cuda.get_device_properties(device).total_memory * 0.4))
+        limit = _graph_cleanup_limits.get(device, base_limit)
+        if torch.cuda.memory_reserved(device) > limit:
+            _graph_pools.pop(device)
+            del previous, g
+            torch.cuda.empty_cache()
+            # Avoid clearing on every capture if live allocations already
+            # exceed the normal limit; retry after another 512 MiB of growth.
+            _graph_cleanup_limits[device] = max(base_limit, torch.cuda.memory_reserved(device) + 512 * 2**20)
 
 
-def _release_graph_pool(device):
+def _release_graph_pool(device, *, empty_cache=False):
     """Release the retained graph so its pool can be freed by the allocator."""
     if torch.device(device).type != 'cuda':
         return False
     with _graph_pool_lock, torch.cuda.device(device):
-        return _graph_pools.pop(torch.cuda.current_device(), None) is not None
+        index = torch.cuda.current_device()
+        _graph_cleanup_limits.pop(index, None)
+        released = _graph_pools.pop(index, None) is not None
+        if empty_cache:
+            # Serialize cache release with other threads' graph captures.
+            torch.cuda.empty_cache()
+        return released
 
 
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
@@ -634,9 +652,11 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     if clear_cache:
                         if v:
                             log_performance(logger, header='clustering_qr before gc')
-                        _release_graph_pool(device)
                         gc.collect()
-                        torch.cuda.empty_cache()
+                        if torch.device(device).type == 'cuda':
+                            _release_graph_pool(device, empty_cache=True)
+                        else:
+                            torch.cuda.empty_cache()
                         if v:
                             log_performance(logger, header='clustering_qr after gc')
 
@@ -680,11 +700,9 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
         for f in futures.values():
             f.cancel()
         prefetch.shutdown(wait=True)
-        if _release_graph_pool(device):
-            # Graph-private cached blocks otherwise remain reserved after the
-            # graph is gone, including on WDDM where allocations can spill.
-            with torch.cuda.device(device):
-                torch.cuda.empty_cache()
+        # Graph-private cached blocks otherwise remain reserved after the
+        # graph is gone, including on WDDM where allocations can spill.
+        _release_graph_pool(device, empty_cache=True)
 
     if nearby_chans_empty == total_centers:
         raise ValueError(
