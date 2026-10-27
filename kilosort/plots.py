@@ -263,6 +263,18 @@ class _BackgroundPlots:
                 + err.decode(errors='replace')
                 )
 
+    def cancel(self):
+        """Stop the plotting process (e.g. after an error) and clean up."""
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc.communicate()
+            self._proc = None
+            if self._owns_args:
+                try:
+                    os.remove(self._args_path)
+                except OSError:
+                    pass
+
 
 class BackgroundDriftPlots(_BackgroundPlots):
     """`plot_drift_amount` and `plot_drift_scatter` in a separate process."""
@@ -336,8 +348,16 @@ class BackgroundSpikePositions:
         import shutil
         from matplotlib import image
         try:
+            # Wait for all processes before raising, so that none of them
+            # still has a file open when the temporary folder is removed.
+            errors = []
             for p in self._procs:
-                p.wait()
+                try:
+                    p.wait()
+                except RuntimeError as e:
+                    errors.append(e)
+            if errors:
+                raise errors[0]
             if self._tmpdir is not None and self._strips:
                 strips = [np.load(s) for s in self._strips]
                 self._strips = []
@@ -349,6 +369,15 @@ class BackgroundSpikePositions:
             if self._tmpdir is not None:
                 shutil.rmtree(self._tmpdir, ignore_errors=True)
                 self._tmpdir = None
+
+    def cancel(self):
+        """Stop the plotting processes (e.g. after an error) and clean up."""
+        import shutil
+        for p in self._procs:
+            p.cancel()
+        if self._tmpdir is not None:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
 
 
 def _drift_plots_from_file(path):

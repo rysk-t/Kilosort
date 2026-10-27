@@ -205,9 +205,12 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
     -----
     filename is expected to be a list of Paths at this point, even if it's
     a singleton list.
-    
+
     """
 
+    # Plots drawn in separate processes; waited for at the end, or stopped
+    # if sorting fails.
+    background_plots = []
     try:
         logger.info(f"Kilosort version {kilosort.__version__}")
         logger.info(f"Python version {platform.python_version()}")
@@ -289,7 +292,6 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         logger.info('Generating drift plots ...')
         # st0 will be None if nblocks = 0 (no drift correction)
-        drift_plots = None
         if st0 is not None:
             if gui_sorter is not None:
                 gui_sorter.dshift = ops['dshift']
@@ -297,9 +299,9 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
                 gui_sorter.plotDataReady.emit('drift')
             else:
                 # Drawn in a separate process while sorting continues.
-                drift_plots = kplots.BackgroundDriftPlots(
+                background_plots.append(kplots.BackgroundDriftPlots(
                     ops, st0, results_dir, tmin=settings['tmin']
-                    )
+                    ))
 
         # Sort spikes and save results
         st,tF, Wall0, clu0 = detect_spikes(
@@ -310,7 +312,6 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
         log_thread_count(logger)
 
         logger.info('Generating diagnostic plots ...')
-        diagnostic_plots = None
         if gui_sorter is not None:
             gui_sorter.Wall0 = Wall0
             gui_sorter.wPCA = torch.clone(ops['wPCA'].cpu()).numpy()
@@ -318,9 +319,9 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             gui_sorter.plotDataReady.emit('diagnostics')
         else:
             # Drawn in a separate process while sorting continues.
-            diagnostic_plots = kplots.BackgroundDiagnostics(
+            background_plots.append(kplots.BackgroundDiagnostics(
                 Wall0, clu0, ops, results_dir
-                )
+                ))
 
         clu, Wall, st, tF = cluster_spikes(
             st, tF, ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
@@ -332,11 +333,10 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
         # Draw the spike position plot in a separate process, started as
         # soon as the refractory labels are known, while the rest of the
         # export runs.
-        position_plot = []
         def start_position_plot(spike_clusters, is_ref, spike_positions):
             if gui_sorter is None:
                 logger.info('Generating spike position plot ...')
-                position_plot.append(kplots.BackgroundSpikePositions(
+                background_plots.append(kplots.BackgroundSpikePositions(
                     spike_clusters, is_ref, spike_positions, results_dir
                     ))
 
@@ -359,9 +359,9 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
             gui_sorter.is_refractory = is_ref
             gui_sorter.plotDataReady.emit('probe')
         else:
-            for p in [drift_plots, diagnostic_plots] + position_plot:
-                if p is not None:
-                    p.wait()
+            while background_plots:
+                background_plots[0].wait()
+                background_plots.pop(0)
         logger.info('Sorting finished.')
         log_sorting_summary(ops, log=logger, level='info')
         
@@ -373,6 +373,12 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         # This makes sure the full traceback is written to log file.
         logger.exception('Encountered error in `run_kilosort`:')
+        # Don't leave plotting processes and their temporary files behind.
+        for p in background_plots:
+            try:
+                p.cancel()
+            except Exception:
+                pass
         # Annoyingly, this will print the error message twice for console, but
         # I haven't found a good way around that.
         raise
