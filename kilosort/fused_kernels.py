@@ -16,8 +16,9 @@ Set the environment variable ``KILOSORT_FUSED_KERNELS=0`` to disable them.
 
 ``KILOSORT_FUSED_VERIFY`` controls how many calls are checked against the
 PyTorch implementation: ``1`` (default) checks the first call of each kernel
-and silently falls back on a mismatch, an integer ``N`` checks the first N
-calls, and ``all`` checks every call. With an explicit setting a mismatch
+(for each distinct problem size; calls whose outputs are empty, e.g. a
+silent first batch, do not count) and silently falls back on a mismatch, an
+integer ``N`` checks the first N calls, and ``all`` checks every call. With an explicit setting a mismatch
 raises an error, so a full run with ``KILOSORT_FUSED_VERIFY=all`` proves that
 the kernels are bit-identical on that data.
 """
@@ -76,15 +77,35 @@ def _describe_mismatch(ref, new):
     return '; '.join(parts)
 
 
+def _signature(args, kwargs):
+    """Shapes / dtypes of the tensor arguments and the plain scalars, so that
+    the verification is redone for every distinct problem size (a second
+    run_kilosort in the same process, another probe, other settings)."""
+    def sig(v):
+        if torch.is_tensor(v):
+            return (tuple(v.shape), str(v.dtype), str(v.device))
+        if isinstance(v, (bool, int, float, str, np.integer, np.floating)):
+            return v
+        if isinstance(v, dict):
+            return tuple((k, sig(x)) for k, x in v.items()
+                         if torch.is_tensor(x) or isinstance(
+                             x, (bool, int, float, str, dict, np.integer, np.floating)))
+        return None
+    return (tuple(sig(a) for a in args), tuple((k, sig(v)) for k, v in kwargs.items()))
+
+
 def verified_call(key, reference, fused, *args, **kwargs):
     """Call `fused` instead of `reference` once it has been checked.
 
-    On the first call(s) both are run and the reference output is returned.
-    Later calls use `fused` only if the checked outputs were bit-identical;
-    any exception from the fused path (e.g. CuPy not installed) also falls
-    back to `reference`. See the module docstring for KILOSORT_FUSED_VERIFY.
+    On the first call(s) with a given problem size both are run and the
+    reference output is returned. Later calls use `fused` only if the
+    checked outputs were bit-identical; any exception from the fused path
+    (e.g. CuPy not installed) also falls back to `reference`, as does a
+    ValueError (unsupported shape) raised later. See the module docstring
+    for KILOSORT_FUSED_VERIFY.
     """
-    state = _state.setdefault(key, {'n_checked': 0, 'use_fused': None})
+    state = _state.setdefault((key, _signature(args, kwargs)),
+                              {'n_checked': 0, 'use_fused': None})
     n_verify, strict = _verify_setting()
     if state['use_fused'] is None and state['n_checked'] >= n_verify:
         # n_verify == 0: use the fused kernel without checking it.
@@ -93,6 +114,12 @@ def verified_call(key, reference, fused, *args, **kwargs):
         ref = reference(*args, **kwargs)
         try:
             new = fused(*args, **kwargs)
+        except ValueError as e:
+            # unsupported shape / dtype for this fused kernel
+            state['use_fused'] = False
+            logger.info(f'Fused kernel for {key}: {e}; using the PyTorch '
+                        'implementation.')
+            return ref
         except Exception as e:
             state['use_fused'] = False
             cuda = getattr(torch.version, 'cuda', None)
@@ -100,7 +127,10 @@ def verified_call(key, reference, fused, *args, **kwargs):
                            'using the PyTorch implementation. '
                            + _INSTALL_HINT.format(cuda=cuda))
             return ref
-        state['n_checked'] += 1
+        # A call without any output (e.g. no spikes in the batch) exercises
+        # almost none of the kernel, so it does not count as a check.
+        if any(torch.is_tensor(a) and a.numel() > 0 for a in ref):
+            state['n_checked'] += 1
         same = (len(ref) == len(new)
                 and all(torch.equal(a, b) for a, b in zip(ref, new)))
         if not same:
@@ -117,7 +147,13 @@ def verified_call(key, reference, fused, *args, **kwargs):
                         f'{state["n_checked"]} call(s).')
         return ref
     if state['use_fused']:
-        return fused(*args, **kwargs)
+        try:
+            return fused(*args, **kwargs)
+        except ValueError as e:
+            # unsupported shape for this fused kernel: use the reference
+            state['use_fused'] = False
+            logger.warning(f'Fused kernel for {key}: {e}; using the PyTorch '
+                           'implementation.')
     return reference(*args, **kwargs)
 
 
@@ -468,6 +504,18 @@ void cand_kernel(ptr_t pAs, ptr_t pQ, ptr_t piC2, ptr_t plist, ptr_t pcount,
 
 _TILE_G, _TILE_TL, _TILE_TT = 16, 32, 4
 _groups_cache = {}
+_smem_limit = {}
+
+
+def _max_shared_memory():
+    """Largest dynamic shared memory per block (opt-in) of the current GPU."""
+    import cupy as cp
+    dev = cp.cuda.Device()
+    if dev.id not in _smem_limit:
+        attrs = dev.attributes
+        _smem_limit[dev.id] = attrs.get('MaxSharedMemoryPerBlockOptin',
+                                        attrs.get('MaxSharedMemoryPerBlock', 48 * 1024))
+    return _smem_limit[dev.id]
 
 
 def _template_groups(iC, iC_l, G):
@@ -544,7 +592,7 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
     G, TL, TT = _TILE_G, _TILE_TL, _TILE_TT
     umap, uch, umax, ngroups = _template_groups(iC, iC_l, G)
     smem = umax * nk * TL * 4
-    tiled = smem <= 96 * 1024
+    tiled = smem <= _max_shared_memory()
     with _stream():
         if tiled:
             as_tile = _function('template_match', 'as_tile_kernel',
@@ -599,47 +647,76 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
 _SOURCES['run_matching'] = r"""
 typedef unsigned long long ptr_t;
 
-// Cf = relu(B)**2 / nm (zero at the edges), then max over templates with the
-// lowest index among ties, without materializing Cf.
+// B is kept transposed, Bt[t, i] (NT x NU), so that the templates of one
+// column are contiguous. c_i(t) = relu(Bt[t, i])**2 / nm[i] (zero at the
+// edges); one warp per column: the lanes stride over the templates, then a
+// shuffle reduction keeps the max with the lowest index among ties, which is
+// what the sequential scan of the PyTorch version (torch.max) returns.
 __device__ __forceinline__
-void cf_column(const float* B, const float* nm, float* Cfmax, long long* imax,
-               int NU, int NT, int nt, int t)
+void cf_column_warp(const float* Bt, const float* nm, float* Cfmax, long long* imax,
+                    int NU, int NT, int nt, int t, int lane)
 {
-    float best = 0.0f;
-    long long bi = 0;
-    if (t >= nt && t < NT - nt) {
-        float r = B[t];
-        r = r < 0.0f ? 0.0f : r;
-        best = (r * r) / nm[0];
-        for (int i = 1; i < NU; ++i) {
-            float v = B[(long long)i * NT + t];
-            v = v < 0.0f ? 0.0f : v;
-            float c = (v * v) / nm[i];
-            if (c > best) { best = c; bi = i; }
-        }
+    if (t < nt || t >= NT - nt) {
+        if (lane == 0) { Cfmax[t] = 0.0f; imax[t] = 0; }
+        return;
     }
-    Cfmax[t] = best;
-    imax[t] = bi;
+    const float* col = Bt + (long long)t * NU;
+    float best = -1.0f;
+    int bi = 0x7fffffff;
+    for (int i = lane; i < NU; i += 32) {
+        float v = col[i];
+        v = v < 0.0f ? 0.0f : v;
+        float c = (v * v) / nm[i];
+        if (c > best) { best = c; bi = i; }
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        float ob = __shfl_xor_sync(0xffffffffu, best, off);
+        int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+        if (ob > best || (ob == best && oi < bi)) { best = ob; bi = oi; }
+    }
+    if (lane == 0) { Cfmax[t] = best; imax[t] = (long long)bi; }
 }
 
 extern "C" __global__
-void cfmax_kernel(ptr_t pB, ptr_t pnm, ptr_t pCf, ptr_t pim, int NU, int NT, int nt)
+void cfmax_kernel(ptr_t pBt, ptr_t pnm, ptr_t pCf, ptr_t pim, int NU, int NT, int nt)
 {
-    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    int t = blockIdx.x * (blockDim.x >> 5) + (threadIdx.x >> 5);
     if (t >= NT) return;
-    cf_column((const float*)pB, (const float*)pnm, (float*)pCf, (long long*)pim, NU, NT, nt, t);
+    cf_column_warp((const float*)pBt, (const float*)pnm, (float*)pCf, (long long*)pim,
+                   NU, NT, nt, t, threadIdx.x & 31);
 }
 
 // Same, only for the columns x - nt .. x + nt around the spikes st[k0 .. k0+n)
 // (the only columns of B that the last peel changed).
 extern "C" __global__
-void cfmax_dirty_kernel(ptr_t pB, ptr_t pnm, ptr_t pCf, ptr_t pim, ptr_t pst,
+void cfmax_dirty_kernel(ptr_t pBt, ptr_t pnm, ptr_t pCf, ptr_t pim, ptr_t pst,
                         int k0, int NU, int NT, int nt)
 {
     const long long* st = (const long long*)pst;
-    int t = (int)st[(long long)(k0 + blockIdx.x) * 2] + (int)threadIdx.x - nt;
-    if (threadIdx.x > 2 * nt || t < 0 || t >= NT) return;
-    cf_column((const float*)pB, (const float*)pnm, (float*)pCf, (long long*)pim, NU, NT, nt, t);
+    int j = blockIdx.y * (blockDim.x >> 5) + (threadIdx.x >> 5);
+    if (j > 2 * nt) return;
+    int t = (int)st[(long long)(k0 + blockIdx.x) * 2] + j - nt;
+    if (t < 0 || t >= NT) return;
+    cf_column_warp((const float*)pBt, (const float*)pnm, (float*)pCf, (long long*)pim,
+                   NU, NT, nt, t, threadIdx.x & 31);
+}
+
+// out[j, i] = in[i, j] for an (R x C) matrix, 32x32 tiles through shared memory
+extern "C" __global__
+void transpose_kernel(ptr_t pin, ptr_t pout, int R, int C)
+{
+    const float* in = (const float*)pin;
+    float* out = (float*)pout;
+    __shared__ float tile[32][33];
+    int c = blockIdx.x * 32 + threadIdx.x;
+    int r = blockIdx.y * 32 + threadIdx.y;
+    for (int k = 0; k < 32; k += 8)
+        if (c < C && r + k < R) tile[threadIdx.y + k][threadIdx.x] = in[(long long)(r + k) * C + c];
+    __syncthreads();
+    c = blockIdx.y * 32 + threadIdx.x;      // row of `in` -> column of `out`
+    r = blockIdx.x * 32 + threadIdx.y;      // column of `in` -> row of `out`
+    for (int k = 0; k < 32; k += 8)
+        if (c < R && r + k < C) out[(long long)(r + k) * R + c] = tile[threadIdx.x][threadIdx.y + k];
 }
 
 // Cmax = max_pool1d(Cfmax, 2*nt+1); mask = (Cmax > Th**2) & (|Cmax - Cfmax| < 1e-9)
@@ -670,9 +747,12 @@ void pool_dirty_kernel(ptr_t pCf, ptr_t pCm, ptr_t pmask, ptr_t pst, int k0,
                        int NT, int nt, float th2, float eps)
 {
     const long long* st = (const long long*)pst;
-    int t = (int)st[(long long)(k0 + blockIdx.x) * 2] + (int)threadIdx.x - 2 * nt;
-    if (threadIdx.x > 4 * nt || t < 0 || t >= NT) return;
-    pool_column((const float*)pCf, (float*)pCm, (bool*)pmask, NT, nt, th2, eps, t);
+    const int x = (int)st[(long long)(k0 + blockIdx.x) * 2];
+    for (int j = threadIdx.x; j <= 4 * nt; j += blockDim.x) {
+        int t = x + j - 2 * nt;
+        if (t >= 0 && t < NT)
+            pool_column((const float*)pCf, (float*)pCm, (bool*)pmask, NT, nt, th2, eps, t);
+    }
 }
 
 // One block: xs = nonzero(mask) in ascending order; for the n new spikes
@@ -680,13 +760,13 @@ void pool_dirty_kernel(ptr_t pCf, ptr_t pCm, ptr_t pmask, ptr_t pst, int k0,
 // info[0] = n, info[1] = 1 if two spikes of the same parity are closer than
 // 2*nt + 1 (their update windows overlap), info[2] = 1 if k + n > capacity.
 extern "C" __global__
-void compact_kernel(ptr_t pmask, ptr_t pim, ptr_t pB, ptr_t pnm, ptr_t pCm,
+void compact_kernel(ptr_t pmask, ptr_t pim, ptr_t pBt, ptr_t pnm, ptr_t pCm,
                     ptr_t pst, ptr_t pamp, ptr_t pth, ptr_t pxs, ptr_t pinfo,
-                    int k, int capacity, int NT, int nt)
+                    int k, int capacity, int NU, int NT, int nt)
 {
     const bool* mask = (const bool*)pmask;
     const long long* imax = (const long long*)pim;
-    const float* B = (const float*)pB;
+    const float* Bt = (const float*)pBt;
     const float* nm = (const float*)pnm;
     const float* Cmax = (const float*)pCm;
     long long* st = (long long*)pst;
@@ -720,7 +800,7 @@ void compact_kernel(ptr_t pmask, ptr_t pim, ptr_t pB, ptr_t pnm, ptr_t pCm,
                 long long y = imax[t];
                 st[(long long)(k + pos) * 2] = t;
                 st[(long long)(k + pos) * 2 + 1] = y;
-                amps[k + pos] = B[y * NT + t] / nm[y];
+                amps[k + pos] = Bt[(long long)t * NU + y] / nm[y];
                 th[k + pos] = sqrtf(Cmax[t]);
             }
             ++pos;
@@ -736,19 +816,20 @@ void compact_kernel(ptr_t pmask, ptr_t pim, ptr_t pB, ptr_t pnm, ptr_t pCm,
 
 // In-place update for the spikes s = k + j, k + j + 2, ... (half j), whose
 // windows don't overlap:
-//   B[r, x+tau-nt]    -= amp * ctc[r, y, tau]   for the rows r with ctc[r, y, :] != 0
+//   Bt[x+tau-nt, r]   -= amp * ctc[r, y, tau]   for the rows r with ctc[r, y, :] != 0
 //   Xres[c, x+l-nt/2] -= amp * E[c, q, l]       for the channels c with U[y, :, c] != 0
 // Rows / channels with all-zero ctc / E are skipped: subtracting amp * 0
-// leaves B and Xres bit-identical.
+// leaves B and Xres bit-identical. blockIdx.y == 0 does the B rows (threads
+// over the rows, one column of Bt at a time), blockIdx.y - 1 is the channel.
 extern "C" __global__
-void upd_kernel(ptr_t pst, ptr_t pamp, ptr_t pB, ptr_t pctc, ptr_t pX, ptr_t pE,
+void upd_kernel(ptr_t pst, ptr_t pamp, ptr_t pBt, ptr_t pctc, ptr_t pX, ptr_t pE,
                 ptr_t prows, ptr_t prow0, ptr_t pchans, ptr_t pch0,
-                int k, int j, int LR, int NU, int NT, int nt,
+                int k, int j, int NU, int NT, int nt,
                 long long e0, long long e1, long long e2)
 {
     const long long* st = (const long long*)pst;
     const float* amps = (const float*)pamp;
-    float* B = (float*)pB;
+    float* Bt = (float*)pBt;
     const float* ctc = (const float*)pctc;
     float* X = (float*)pX;
     const float* E = (const float*)pE;
@@ -761,92 +842,123 @@ void upd_kernel(ptr_t pst, ptr_t pamp, ptr_t pB, ptr_t pctc, ptr_t pX, ptr_t pE,
     const long long x = st[(long long)s * 2];
     const int y = (int)st[(long long)s * 2 + 1];
     const float amp = amps[s];
-    const int tau = threadIdx.x;
-    if (blockIdx.y < LR) {
-        int idx = row0[y] + blockIdx.y;
-        if (idx >= row0[y + 1]) return;
-        int nw = 2 * nt + 1;
-        if (tau >= nw) return;
-        int r = rows[idx];
-        float p = amp * ctc[((long long)r * NU + y) * nw + tau];
-        long long i = (long long)r * NT + x + tau - nt;
-        B[i] = B[i] - p;
+    if (blockIdx.y == 0) {
+        const int r0 = row0[y], nr = row0[y + 1] - r0, nw = 2 * nt + 1;
+        for (int e = threadIdx.x; e < nr * nw; e += blockDim.x) {
+            int idx = e % nr, tau = e / nr;
+            int r = rows[r0 + idx];
+            float p = amp * ctc[((long long)r * NU + y) * nw + tau];
+            long long i = (x + tau - nt) * NU + r;
+            Bt[i] = Bt[i] - p;
+        }
     } else {
-        int idx = ch0[y] + (blockIdx.y - LR);
+        int idx = ch0[y] + (blockIdx.y - 1);
         if (idx >= ch0[y + 1]) return;
         int nw = 2 * (nt / 2) + 1;
-        if (tau >= nw) return;
         int c = chans[idx];
-        float p = amp * E[c * e0 + q * e1 + tau * e2];
-        long long i = (long long)c * NT + x + tau - nt / 2;
-        X[i] = X[i] - p;
+        for (int tau = threadIdx.x; tau < nw; tau += blockDim.x) {
+            float p = amp * E[c * e0 + q * e1 + tau * e2];
+            long long i = (long long)c * NT + x + tau - nt / 2;
+            X[i] = X[i] - p;
+        }
     }
 }
 
 // Fallback when windows of the same half overlap (ties): read and subtract
 // into temporaries, then write back, like the gather / scatter of
-// `B[:, idx] -= ...` in PyTorch.
+// `B[:, idx] -= ...` in PyTorch. Grid (m, LR + LC), threads over tau.
 extern "C" __global__
-void upd1_kernel(ptr_t pst, ptr_t pamp, ptr_t pB, ptr_t pctc, ptr_t pX, ptr_t pE,
-                 ptr_t ptB, ptr_t ptX, int k, int j, int m, int NU, int NC, int NT, int nt,
+void upd1_kernel(ptr_t pst, ptr_t pamp, ptr_t pBt, ptr_t pctc, ptr_t pX, ptr_t pE,
+                 ptr_t prows, ptr_t prow0, ptr_t pchans, ptr_t pch0,
+                 ptr_t ptB, ptr_t ptX, int k, int j, int LR, int LC, int NU, int NT, int nt,
                  long long e0, long long e1, long long e2)
 {
     const long long* st = (const long long*)pst;
     const float* amps = (const float*)pamp;
-    const float* B = (const float*)pB;
+    const float* Bt = (const float*)pBt;
     const float* ctc = (const float*)pctc;
     const float* X = (const float*)pX;
     const float* E = (const float*)pE;
+    const int* rows = (const int*)prows;
+    const int* row0 = (const int*)prow0;
+    const int* chans = (const int*)pchans;
+    const int* ch0 = (const int*)pch0;
     float* tB = (float*)ptB;
     float* tX = (float*)ptX;
-    int row = blockIdx.x;                  // 0 .. m*(NU+NC)-1
-    int q = row / (NU + NC), r = row % (NU + NC);
-    int s = k + j + 2 * q;
-    long long x = st[(long long)s * 2];
-    float amp = amps[s];
-    int tau = threadIdx.x;
-    if (r < NU) {
+    const int q = blockIdx.x;
+    const int s = k + j + 2 * q;
+    const long long x = st[(long long)s * 2];
+    const int y = (int)st[(long long)s * 2 + 1];
+    const float amp = amps[s];
+    if (blockIdx.y < LR) {
+        int idx = row0[y] + blockIdx.y;
         int nw = 2 * nt + 1;
-        if (tau >= nw) return;
-        long long y = st[(long long)s * 2 + 1];
-        float p = amp * ctc[((long long)r * NU + y) * nw + tau];
-        tB[((long long)q * NU + r) * nw + tau] = B[(long long)r * NT + x + tau - nt] - p;
+        if (idx >= row0[y + 1]) return;
+        int r = rows[idx];
+        for (int tau = threadIdx.x; tau < nw; tau += blockDim.x) {
+            float p = amp * ctc[((long long)r * NU + y) * nw + tau];
+            tB[((long long)q * LR + blockIdx.y) * nw + tau] = Bt[(x + tau - nt) * NU + r] - p;
+        }
     } else {
-        int c = r - NU, nw = 2 * (nt / 2) + 1;
-        if (tau >= nw) return;
-        float p = amp * E[c * e0 + q * e1 + tau * e2];
-        tX[((long long)q * NC + c) * nw + tau] = X[(long long)c * NT + x + tau - nt / 2] - p;
+        int idx = ch0[y] + (blockIdx.y - LR);
+        int nw = 2 * (nt / 2) + 1;
+        if (idx >= ch0[y + 1]) return;
+        int c = chans[idx];
+        for (int tau = threadIdx.x; tau < nw; tau += blockDim.x) {
+            float p = amp * E[c * e0 + q * e1 + tau * e2];
+            tX[((long long)q * LC + (blockIdx.y - LR)) * nw + tau] = X[(long long)c * NT + x + tau - nt / 2] - p;
+        }
     }
 }
 
 extern "C" __global__
-void upd2_kernel(ptr_t pst, ptr_t pB, ptr_t pX, ptr_t ptB, ptr_t ptX,
-                 int k, int j, int m, int NU, int NC, int NT, int nt)
+void upd2_kernel(ptr_t pst, ptr_t pBt, ptr_t pX, ptr_t prows, ptr_t prow0, ptr_t pchans, ptr_t pch0,
+                 ptr_t ptB, ptr_t ptX, int k, int j, int LR, int LC, int NU, int NT, int nt)
 {
     const long long* st = (const long long*)pst;
-    float* B = (float*)pB;
+    float* Bt = (float*)pBt;
     float* X = (float*)pX;
+    const int* rows = (const int*)prows;
+    const int* row0 = (const int*)prow0;
+    const int* chans = (const int*)pchans;
+    const int* ch0 = (const int*)pch0;
     const float* tB = (const float*)ptB;
     const float* tX = (const float*)ptX;
-    int row = blockIdx.x;
-    int q = row / (NU + NC), r = row % (NU + NC);
-    int s = k + j + 2 * q;
-    long long x = st[(long long)s * 2];
-    int tau = threadIdx.x;
-    if (r < NU) {
+    const int q = blockIdx.x;
+    const int s = k + j + 2 * q;
+    const long long x = st[(long long)s * 2];
+    const int y = (int)st[(long long)s * 2 + 1];
+    if (blockIdx.y < LR) {
+        int idx = row0[y] + blockIdx.y;
         int nw = 2 * nt + 1;
-        if (tau >= nw) return;
-        B[(long long)r * NT + x + tau - nt] = tB[((long long)q * NU + r) * nw + tau];
+        if (idx >= row0[y + 1]) return;
+        int r = rows[idx];
+        for (int tau = threadIdx.x; tau < nw; tau += blockDim.x)
+            Bt[(x + tau - nt) * NU + r] = tB[((long long)q * LR + blockIdx.y) * nw + tau];
     } else {
-        int c = r - NU, nw = 2 * (nt / 2) + 1;
-        if (tau >= nw) return;
-        X[(long long)c * NT + x + tau - nt / 2] = tX[((long long)q * NC + c) * nw + tau];
+        int idx = ch0[y] + (blockIdx.y - LR);
+        int nw = 2 * (nt / 2) + 1;
+        if (idx >= ch0[y + 1]) return;
+        int c = chans[idx];
+        for (int tau = threadIdx.x; tau < nw; tau += blockDim.x)
+            X[(long long)c * NT + x + tau - nt / 2] = tX[((long long)q * LC + (blockIdx.y - LR)) * nw + tau];
     }
 }
 """
 
 _CTPB = 1024
 _sparsity_cache = {}
+
+
+def _transpose(A):
+    """A.t().contiguous() for a 2-D float32 CUDA tensor (torch's copy is
+    several times slower than the bandwidth for these shapes)."""
+    R, C = A.shape
+    out = torch.empty((C, R), device=A.device, dtype=A.dtype)
+    kern = _function('run_matching', 'transpose_kernel', (('CTPB', _CTPB),))
+    with _stream():
+        kern(((C + 31) // 32, (R + 31) // 32), (32, 8), (_p(A), _p(out), *_i32(R, C)))
+    return out
 
 
 def _csr(nz):
@@ -882,14 +994,17 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     Per peel the PyTorch version launches ~70 kernels, writes
     Cf = relu(B)**2 / nm (n_templates x NT) three times and gathers /
     scatters a window of all n_templates rows of B for every spike. Here:
-    - Cf is never materialized, and after the first peel only the columns
-      that the last peel changed are recomputed;
+    - B is kept transposed (time x templates) so that the max over the
+      templates of a column reads contiguous memory, Cf is never
+      materialized, and after the first peel only the columns that the last
+      peel changed are recomputed;
     - the spikes are compacted, recorded and checked for overlapping windows
       by one block, so one small copy per peel brings back the count;
     - B and Xres are updated in place, only in the rows of ctc / channels of
       the template that are not identically zero.
-    The matrix products (conv1d, the B einsum and the per-spike waveform
-    einsum) are the same PyTorch calls, so they round the same way.
+    The matrix products (conv1d, the B matmul and the per-spike waveform
+    matmul) are the same cuBLAS calls as in the PyTorch version, so they
+    round the same way.
     """
     Th = ops['Th_learned']
     nt = ops['nt']
@@ -904,6 +1019,9 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     B = conv1d_templates(X, W, nt//2, kmajor=True)
     NU = U.shape[0]
     B = U.reshape(NU, -1) @ B.reshape(-1, B.shape[-1])
+    NT = B.shape[1]
+    Bt = _transpose(B.contiguous())    # (NT, NU)
+    del B
 
     capacity = 100000
     st = torch.zeros((capacity,2), dtype = torch.int64, device = device)
@@ -913,13 +1031,11 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
 
     Xres = X.clone(memory_format=torch.contiguous_format)
 
-    B = B.contiguous()
     nm = nm.contiguous()
     ctc = ctc.contiguous()
-    NU, NT = B.shape
     NC = Xres.shape[0]
     if (ctc.shape != (NU, NU, 2*nt + 1) or Xres.shape[1] != NT
-            or not (B.dtype == nm.dtype == ctc.dtype == Xres.dtype == torch.float32)):
+            or not (Bt.dtype == nm.dtype == ctc.dtype == Xres.dtype == torch.float32)):
         raise ValueError('unsupported shape or dtype for fused run_matching')
     rows, row0, LR, chans, ch0, LC = _template_sparsity(U, ctc)
     Cfmax = torch.empty(NT, device=device)
@@ -931,9 +1047,11 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     th2 = np.float32(Th**2)
     eps = np.float32(1e-9)
     tpb = 128
+    wpb = tpb // 32                        # columns per block in the cfmax kernels
     gridT = ((NT + tpb - 1) // tpb,)
+    gridW = ((NT + wpb - 1) // wpb,)
     nwB, nwX = 2*nt + 1, 2*(nt//2) + 1
-    tpb_upd = (max(nwB, nwX) + 31) // 32 * 32
+    tpb_upd = min(1024, (max(nwB, nwX) + 31) // 32 * 32)
 
     consts = (('CTPB', _CTPB),)
     cfmax = _function('run_matching', 'cfmax_kernel', consts)
@@ -952,18 +1070,20 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
             # more columns than the full pass, which is then cheaper. Both
             # paths use the same per-column device functions.
             if t == 0 or nsp * nwB >= NT:
-                cfmax(gridT, (tpb,), (_p(B), _p(nm), _p(Cfmax), _p(imax), *_i32(NU, NT, nt)))
+                cfmax(gridW, (tpb,), (_p(Bt), _p(nm), _p(Cfmax), _p(imax), *_i32(NU, NT, nt)))
             else:
-                cfmax_dirty((nsp,), (nwB,), (_p(B), _p(nm), _p(Cfmax), _p(imax), _p(st),
-                                             *_i32(k - nsp, NU, NT, nt)))
+                cfmax_dirty((nsp, (nwB + wpb - 1) // wpb), (tpb,),
+                            (_p(Bt), _p(nm), _p(Cfmax), _p(imax), _p(st),
+                             *_i32(k - nsp, NU, NT, nt)))
             if t == 0 or nsp * (2 * nwB - 1) >= NT:
                 pool(gridT, (tpb,), (_p(Cfmax), _p(Cmax), _p(mask), *_i32(NT, nt), th2, eps))
             else:
-                pool_dirty((nsp,), (2 * nwB - 1,), (_p(Cfmax), _p(Cmax), _p(mask), _p(st),
-                                                    *_i32(k - nsp, NT, nt), th2, eps))
-            compact((1,), (_CTPB,), (_p(mask), _p(imax), _p(B), _p(nm), _p(Cmax),
+                pool_dirty((nsp,), (min(1024, 2 * nwB - 1),),
+                           (_p(Cfmax), _p(Cmax), _p(mask), _p(st),
+                            *_i32(k - nsp, NT, nt), th2, eps))
+            compact((1,), (_CTPB,), (_p(mask), _p(imax), _p(Bt), _p(nm), _p(Cmax),
                                       _p(st), _p(amps), _p(th_amps), _p(xs), _p(info),
-                                      *_i32(k, capacity, NT, nt)))
+                                      *_i32(k, capacity, NU, NT, nt)))
             nsp, overlap, overflow = info.tolist()
             if nsp == 0:
                 break
@@ -982,21 +1102,23 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
                 E = (U[iY[j::2,0]].permute(0, 2, 1) @ W).permute(1, 0, 2)
                 e0, e1, e2 = E.stride()
                 if not overlap:
-                    upd((m, LR + LC), (tpb_upd,),
-                        (_p(st), _p(amps), _p(B), _p(ctc), _p(Xres), _p(E),
+                    upd((m, 1 + LC), (tpb_upd,),
+                        (_p(st), _p(amps), _p(Bt), _p(ctc), _p(Xres), _p(E),
                          _p(rows), _p(row0), _p(chans), _p(ch0),
-                         *_i32(k, j, LR, NU, NT, nt),
+                         *_i32(k, j, NU, NT, nt),
                          np.int64(e0), np.int64(e1), np.int64(e2)))
                 else:
-                    tB = torch.empty((m, NU, nwB), device=device)
-                    tX = torch.empty((m, NC, nwX), device=device)
-                    upd1((m * (NU + NC),), (tpb_upd,),
-                         (_p(st), _p(amps), _p(B), _p(ctc), _p(Xres), _p(E),
-                          _p(tB), _p(tX), *_i32(k, j, m, NU, NC, NT, nt),
+                    tB = torch.empty((m, LR, nwB), device=device)
+                    tX = torch.empty((m, LC, nwX), device=device)
+                    upd1((m, LR + LC), (tpb_upd,),
+                         (_p(st), _p(amps), _p(Bt), _p(ctc), _p(Xres), _p(E),
+                          _p(rows), _p(row0), _p(chans), _p(ch0), _p(tB), _p(tX),
+                          *_i32(k, j, LR, LC, NU, NT, nt),
                           np.int64(e0), np.int64(e1), np.int64(e2)))
-                    upd2((m * (NU + NC),), (tpb_upd,),
-                         (_p(st), _p(B), _p(Xres), _p(tB), _p(tX),
-                          *_i32(k, j, m, NU, NC, NT, nt)))
+                    upd2((m, LR + LC), (tpb_upd,),
+                         (_p(st), _p(Bt), _p(Xres),
+                          _p(rows), _p(row0), _p(chans), _p(ch0), _p(tB), _p(tX),
+                          *_i32(k, j, LR, LC, NU, NT, nt)))
             k += nsp
 
     st = st[:k]
