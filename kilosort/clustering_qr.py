@@ -141,7 +141,7 @@ _graph_pools = {}
 _graph_pool_lock = Lock()
 
 
-def _replay_graph(step, n):
+def _replay_graph(step, n, device):
     """Record one call of `step` as a CUDA graph and replay it `n` times.
 
     The clustering loops launch many tiny kernels per iteration, so their
@@ -155,7 +155,7 @@ def _replay_graph(step, n):
     # Sharing a pool is only safe while graph lifetimes and replays do not
     # overlap. Serialize the whole capture/replay/release, including callers
     # from separate threads, and keep externally visible state outside it.
-    with _graph_pool_lock:
+    with _graph_pool_lock, torch.cuda.device(device):
         device = torch.cuda.current_device()
         previous = _graph_pools.get(device)
         pool = previous[0].pool() if previous is not None else torch.cuda.graph_pool_handle()
@@ -163,7 +163,7 @@ def _replay_graph(step, n):
         g = torch.cuda.CUDAGraph()
         # Avoid torch.cuda.graph's gc.collect()/empty_cache() on older PyTorch.
         # thread_local allows the CPU-only prefetch thread to keep running.
-        torch.cuda.synchronize()
+        torch.cuda.synchronize(device)
         with torch.cuda.stream(capture_stream):
             g.capture_begin(pool=pool, capture_error_mode='thread_local')
             try:
@@ -173,8 +173,16 @@ def _replay_graph(step, n):
         for _ in range(n):
             g.replay()
         # Finish before releasing the previous graph or reusing its pool.
-        torch.cuda.current_stream().synchronize()
+        torch.cuda.current_stream(device).synchronize()
         _graph_pools[device] = (g, capture_stream)
+
+
+def _release_graph_pool(device):
+    """Release the retained graph so its pool can be freed by the allocator."""
+    if torch.device(device).type != 'cuda':
+        return False
+    with _graph_pool_lock, torch.cuda.device(device):
+        return _graph_pools.pop(torch.cuda.current_device(), None) is not None
 
 
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
@@ -229,7 +237,7 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
                     rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj,
                     device=device
                     ))
-            _replay_graph(step, niter - t)
+            _replay_graph(step, niter - t, static_iclust.device)
             iclust = static_iclust
             break
         # given iclust, reassign isub
@@ -355,7 +363,7 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     for j in range(niter):
         try:
             if use_graph and j == _N_EAGER:
-                _replay_graph(step, niter - j)
+                _replay_graph(step, niter - j, Xg.device)
                 break
             step()
         except torch.cuda.OutOfMemoryError:
@@ -626,6 +634,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     if clear_cache:
                         if v:
                             log_performance(logger, header='clustering_qr before gc')
+                        _release_graph_pool(device)
                         gc.collect()
                         torch.cuda.empty_cache()
                         if v:
@@ -671,6 +680,11 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
         for f in futures.values():
             f.cancel()
         prefetch.shutdown(wait=True)
+        if _release_graph_pool(device):
+            # Graph-private cached blocks otherwise remain reserved after the
+            # graph is gone, including on WDDM where allocations can spill.
+            with torch.cuda.device(device):
+                torch.cuda.empty_cache()
 
     if nearby_chans_empty == total_centers:
         raise ValueError(
