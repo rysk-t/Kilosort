@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from kilosort import fused_kernels
@@ -82,7 +83,12 @@ def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
         if nthread is not None:
             new_nthread = min(int(nthread), new_nthread)
         os.environ['OMP_NUM_THREADS'] = str(new_nthread)
-        model = KMeans(n_clusters=ops['settings']['n_templates'], n_init = 10).fit(clips)
+        # sklearn's multithreaded KMeans reduces the per-thread partial sums
+        # in thread completion order, so the centers (and with them the
+        # sorting) differ in the last bits from run to run. One OpenMP thread
+        # makes it deterministic (about 0.5 s more per call).
+        with threadpool_limits(limits=1, user_api='openmp'):
+            model = KMeans(n_clusters=ops['settings']['n_templates'], n_init = 10).fit(clips)
         wTEMP = torch.from_numpy(model.cluster_centers_).to(device).float()
         wTEMP = wTEMP / (wTEMP**2).sum(1).unsqueeze(1)**.5
         if nthread is not None:
