@@ -217,3 +217,241 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
     adist = B[iC[:, xy[:,0]], imax%nk, xy[:,1]] * ssign
 
     return xy, imax, amp, adist
+
+
+# --------------------------------------------------------------------------
+# template_matching.run_matching
+# --------------------------------------------------------------------------
+_SOURCES['run_matching'] = r"""
+typedef unsigned long long ptr_t;
+
+// Cf = relu(B)**2 / nm (zero at the edges), then max over templates with the
+// lowest index among ties, without materializing Cf.
+extern "C" __global__
+void cfmax_kernel(ptr_t pB, ptr_t pnm, ptr_t pCf, ptr_t pim, int NU, int NT, int nt)
+{
+    const float* B = (const float*)pB;
+    const float* nm = (const float*)pnm;
+    float* Cfmax = (float*)pCf;
+    long long* imax = (long long*)pim;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= NT) return;
+    float best = 0.0f;
+    long long bi = 0;
+    if (t >= nt && t < NT - nt) {
+        float r = B[t];
+        r = r < 0.0f ? 0.0f : r;
+        best = (r * r) / nm[0];
+        for (int i = 1; i < NU; ++i) {
+            float v = B[(long long)i * NT + t];
+            v = v < 0.0f ? 0.0f : v;
+            float c = (v * v) / nm[i];
+            if (c > best) { best = c; bi = i; }
+        }
+    }
+    Cfmax[t] = best;
+    imax[t] = bi;
+}
+
+// Cmax = max_pool1d(Cfmax, 2*nt+1); mask = (Cmax > Th**2) & (|Cmax - Cfmax| < 1e-9)
+extern "C" __global__
+void pool_kernel(ptr_t pCf, ptr_t pCm, ptr_t pmask, int NT, int nt, float th2, float eps)
+{
+    const float* Cfmax = (const float*)pCf;
+    float* Cmax = (float*)pCm;
+    bool* mask = (bool*)pmask;
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= NT) return;
+    int a = t - nt < 0 ? 0 : t - nt;
+    int b = t + nt > NT - 1 ? NT - 1 : t + nt;
+    float m = Cfmax[a];
+    for (int i = a + 1; i <= b; ++i) { float v = Cfmax[i]; if (v > m) m = v; }
+    Cmax[t] = m;
+    float d = m - Cfmax[t];
+    mask[t] = (m > th2) && (fabsf(d) < eps);
+}
+
+// st[k+s] = (x, imax[x]); amps[k+s] = B[y, x] / nm[y]; th_amps[k+s] = Cmax[x]**0.5
+extern "C" __global__
+void record_kernel(ptr_t pxs, ptr_t pim, ptr_t pB, ptr_t pnm, ptr_t pCm,
+                   ptr_t pst, ptr_t pamp, ptr_t pth, int n, int k, int NT)
+{
+    const long long* xs = (const long long*)pxs;
+    const long long* imax = (const long long*)pim;
+    const float* B = (const float*)pB;
+    const float* nm = (const float*)pnm;
+    const float* Cmax = (const float*)pCm;
+    long long* st = (long long*)pst;
+    float* amps = (float*)pamp;
+    float* th = (float*)pth;
+    int s = blockIdx.x * blockDim.x + threadIdx.x;
+    if (s >= n) return;
+    long long x = xs[s];
+    long long y = imax[x];
+    st[(long long)(k + s) * 2] = x;
+    st[(long long)(k + s) * 2 + 1] = y;
+    amps[k + s] = B[y * NT + x] / nm[y];
+    th[k + s] = sqrtf(Cmax[x]);
+}
+
+// Peel off half j of the spikes (s = j, j+2, ...), step 1: read and subtract
+// into temporaries (like the gather in `B[:, idx] -= ...`):
+//   tB[q,u,tau] = B[u, x+tau-nt]    - amp * ctc[u, y, tau]
+//   tX[q,c,l]   = Xres[c, x+l-nt/2] - amp * E[c, q, l]
+extern "C" __global__
+void upd1_kernel(ptr_t pst, ptr_t pamp, ptr_t pB, ptr_t pctc, ptr_t pX, ptr_t pE,
+                 ptr_t ptB, ptr_t ptX, int k, int j, int m, int NU, int NC, int NT, int nt,
+                 long long e0, long long e1, long long e2)
+{
+    const long long* st = (const long long*)pst;
+    const float* amps = (const float*)pamp;
+    const float* B = (const float*)pB;
+    const float* ctc = (const float*)pctc;
+    const float* X = (const float*)pX;
+    const float* E = (const float*)pE;
+    float* tB = (float*)ptB;
+    float* tX = (float*)ptX;
+    int row = blockIdx.x;                  // 0 .. m*(NU+NC)-1
+    int q = row / (NU + NC), r = row % (NU + NC);
+    int s = k + j + 2 * q;
+    long long x = st[(long long)s * 2];
+    float amp = amps[s];
+    int tau = threadIdx.x;
+    if (r < NU) {
+        int nw = 2 * nt + 1;
+        if (tau >= nw) return;
+        long long y = st[(long long)s * 2 + 1];
+        float p = amp * ctc[((long long)r * NU + y) * nw + tau];
+        tB[((long long)q * NU + r) * nw + tau] = B[(long long)r * NT + x + tau - nt] - p;
+    } else {
+        int c = r - NU, nw = 2 * (nt / 2) + 1;
+        if (tau >= nw) return;
+        float p = amp * E[c * e0 + q * e1 + tau * e2];
+        tX[((long long)q * NC + c) * nw + tau] = X[(long long)c * NT + x + tau - nt / 2] - p;
+    }
+}
+
+// Step 2: write the temporaries back (like the scatter in `B[:, idx] -= ...`).
+extern "C" __global__
+void upd2_kernel(ptr_t pst, ptr_t pB, ptr_t pX, ptr_t ptB, ptr_t ptX,
+                 int k, int j, int m, int NU, int NC, int NT, int nt)
+{
+    const long long* st = (const long long*)pst;
+    float* B = (float*)pB;
+    float* X = (float*)pX;
+    const float* tB = (const float*)ptB;
+    const float* tX = (const float*)ptX;
+    int row = blockIdx.x;
+    int q = row / (NU + NC), r = row % (NU + NC);
+    int s = k + j + 2 * q;
+    long long x = st[(long long)s * 2];
+    int tau = threadIdx.x;
+    if (r < NU) {
+        int nw = 2 * nt + 1;
+        if (tau >= nw) return;
+        B[(long long)r * NT + x + tau - nt] = tB[((long long)q * NU + r) * nw + tau];
+    } else {
+        int c = r - NU, nw = 2 * (nt / 2) + 1;
+        if (tau >= nw) return;
+        X[(long long)c * NT + x + tau - nt / 2] = tX[((long long)q * NC + c) * nw + tau];
+    }
+}
+"""
+
+
+def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
+    """Fused version of `template_matching.run_matching`.
+
+    Each peel of the PyTorch version launches ~70 small kernels and writes
+    Cf = relu(B)**2 / nm (n_templates x NT) three times. Here the max over
+    templates, the pooling / threshold test, the bookkeeping and the B / Xres
+    updates are a handful of kernels. The matrix products (conv1d, the B
+    einsum and the per-spike waveform einsum) are the same PyTorch calls.
+    """
+    Th = ops['Th_learned']
+    nt = ops['nt']
+    max_peels = ops['max_peels']
+    W = ops['wPCA'].contiguous()
+
+    nm = (U**2).sum(-1).sum(-1)
+
+    B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
+    B = torch.einsum('ijk, kjl -> il', U, B)
+
+    st = torch.zeros((100000,2), dtype = torch.int64, device = device)
+    amps = torch.zeros((100000,1), dtype = torch.float, device = device)
+    th_amps = torch.zeros((100000,1), dtype = torch.float, device = device)
+    k = 0
+
+    Xres = X.clone(memory_format=torch.contiguous_format)
+
+    B = B.contiguous()
+    nm = nm.contiguous()
+    ctc = ctc.contiguous()
+    NU, NT = B.shape
+    NC = Xres.shape[0]
+    if (ctc.shape != (NU, NU, 2*nt + 1) or Xres.shape[1] != NT
+            or not (B.dtype == nm.dtype == ctc.dtype == Xres.dtype == torch.float32)):
+        raise ValueError('unsupported shape or dtype for fused run_matching')
+    Cfmax = torch.empty(NT, device=device)
+    imax = torch.empty(NT, dtype=torch.int64, device=device)
+    Cmax = torch.empty(NT, device=device)
+    mask = torch.empty(NT, dtype=torch.bool, device=device)
+    th2 = np.float32(Th**2)
+    eps = np.float32(1e-9)
+    tpb = 128
+    gridT = ((NT + tpb - 1) // tpb,)
+    nwB, nwX = 2*nt + 1, 2*(nt//2) + 1
+    tpb_upd = (max(nwB, nwX) + 31) // 32 * 32
+
+    cfmax = _function('run_matching', 'cfmax_kernel')
+    pool = _function('run_matching', 'pool_kernel')
+    record = _function('run_matching', 'record_kernel')
+    upd1 = _function('run_matching', 'upd1_kernel')
+    upd2 = _function('run_matching', 'upd2_kernel')
+
+    with _stream():
+        for t in range(max_peels):
+            cfmax(gridT, (tpb,), (_p(B), _p(nm), _p(Cfmax), _p(imax),
+                                  np.int32(NU), np.int32(NT), np.int32(nt)))
+            pool(gridT, (tpb,), (_p(Cfmax), _p(Cmax), _p(mask),
+                                 np.int32(NT), np.int32(nt), th2, eps))
+            xs = torch.nonzero(mask)
+            nsp = len(xs)
+            if nsp == 0:
+                break
+            if k + nsp > st.shape[0]:
+                raise RuntimeError('Too many spikes in one batch for run_matching.')
+            record(((nsp + tpb - 1) // tpb,), (tpb,),
+                   (_p(xs), _p(imax), _p(B), _p(nm), _p(Cmax),
+                    _p(st), _p(amps), _p(th_amps),
+                    np.int32(nsp), np.int32(k), np.int32(NT)))
+            iY = st[k:k+nsp, 1:2]
+            # As in the PyTorch version, every other spike is subtracted at
+            # once so that the subtracted windows don't overlap.
+            for j in range(2):
+                m = (nsp - j + 1) // 2
+                if m == 0:
+                    continue
+                # Same call as the PyTorch version, so the waveforms have the
+                # same cuBLAS rounding.
+                E = torch.einsum('ijk, jl -> kil', U[iY[j::2,0]], W)
+                tB = torch.empty((m, NU, nwB), device=device)
+                tX = torch.empty((m, NC, nwX), device=device)
+                e0, e1, e2 = E.stride()
+                upd1((m * (NU + NC),), (tpb_upd,),
+                     (_p(st), _p(amps), _p(B), _p(ctc), _p(Xres), _p(E),
+                      _p(tB), _p(tX), np.int32(k), np.int32(j), np.int32(m),
+                      np.int32(NU), np.int32(NC), np.int32(NT), np.int32(nt),
+                      np.int64(e0), np.int64(e1), np.int64(e2)))
+                upd2((m * (NU + NC),), (tpb_upd,),
+                     (_p(st), _p(B), _p(Xres), _p(tB), _p(tX),
+                      np.int32(k), np.int32(j), np.int32(m),
+                      np.int32(NU), np.int32(NC), np.int32(NT), np.int32(nt)))
+            k += nsp
+
+    st = st[:k]
+    amps = amps[:k]
+    th_amps = th_amps[:k]
+
+    return st, amps, th_amps, Xres

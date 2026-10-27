@@ -5,7 +5,7 @@ import torch
 from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
-from kilosort import CCG
+from kilosort import CCG, fused_kernels
 from kilosort.utils import log_performance
 
 logger = logging.getLogger(__name__)
@@ -168,6 +168,15 @@ def prepare_matching(ops, U):
 
 
 def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
+    if device.type == 'cuda' and fused_kernels.enabled():
+        return fused_kernels.verified_call(
+            'run_matching', _run_matching_torch, fused_kernels.run_matching,
+            ops, X, U, ctc, device=device
+            )
+    return _run_matching_torch(ops, X, U, ctc, device=device)
+
+
+def _run_matching_torch(ops, X, U, ctc, device=torch.device('cuda')):
     Th = ops['Th_learned']
     nt = ops['nt']
     max_peels = ops['max_peels']
