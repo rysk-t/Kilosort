@@ -21,6 +21,17 @@ from kilosort.postprocessing import (
 from kilosort.utils import log_performance
 
 _torch_warning = ".*PyTorch does not support non-writable tensors"
+_prefetch_executor = None
+
+
+def _prefetch_pool():
+    """Single background thread used to read the next batch from disk."""
+    global _prefetch_executor
+    if _prefetch_executor is None:
+        _prefetch_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix='kilosort-prefetch'
+            )
+    return _prefetch_executor
 
 
 def find_binary(data_dir: Union[str, os.PathLike]) -> Path:
@@ -786,43 +797,94 @@ class BinaryRWFile:
         self.batch_downsampling = downsampling
         self.n_batches = np.int64(self.n_batches_raw / self.batch_downsampling)
 
+    def _can_prefetch(self):
+        # Only plain int16 reads from our own (read-only) memmap are prefetched,
+        # so the background read can't race with writes or with an arbitrary
+        # user-supplied file object.
+        return (str(self.dtype) == 'int16' and self.scale is None
+                and self.shift is None and self.file_object is None
+                and not self.writable and self.device.type == 'cuda')
+
+    def _read_raw_batch(self, ibatch):
+        """Copy the raw int16 samples for `ibatch` into pinned host memory."""
+        bstart, bend = self._get_batch_edges(ibatch)
+        src = self.file[bstart : bend]
+        buf = torch.empty(src.shape, dtype=torch.int16, pin_memory=True)
+        np.copyto(buf.numpy(), src)   # page faults (= disk reads) happen here
+        return buf, bstart, bend
+
+    def _prefetched_batch(self, ibatch):
+        """Return the raw batch `ibatch` and start reading the next one.
+
+        The next batch is guessed from the stride between the last two calls,
+        which covers the sequential passes over the data. A wrong guess only
+        costs one wasted read.
+        """
+        pf = self.__dict__.setdefault('_prefetch', {})
+        fut = pf.pop('future', None)
+        if fut is not None and pf.get('key') == ibatch:
+            buf, bstart, bend = fut.result()
+        else:
+            buf, bstart, bend = self._read_raw_batch(ibatch)
+
+        step = ibatch - pf.get('last', ibatch - self.batch_downsampling)
+        if step <= 0:
+            # e.g. the start of a new pass over the data
+            step = self.batch_downsampling
+        pf['last'] = ibatch
+        nxt = ibatch + step
+        if nxt // self.batch_downsampling < self.n_batches:
+            pf['key'] = nxt
+            pf['future'] = _prefetch_pool().submit(self._read_raw_batch, nxt)
+        return buf, bstart, bend
+
     def padded_batch_to_torch(self, ibatch, return_inds=False):
         """ read batches from file """
         ibatch *= self.batch_downsampling
-        bstart, bend = self._get_batch_edges(ibatch)
-        data = self.file[bstart : bend]
-        data = data.T
+        prefetch = self._can_prefetch()
+        if prefetch:
+            data, bstart, bend = self._prefetched_batch(ibatch)
+            nsamp = data.shape[0]
+        else:
+            bstart, bend = self._get_batch_edges(ibatch)
+            data = self.file[bstart : bend]
+            data = data.T
 
-        if self.dtype == 'uint16':
-            # Shift data to +/- 2**15
-            data = data.astype('float32')
-            data = data - 2**15
+            if self.dtype == 'uint16':
+                # Shift data to +/- 2**15
+                data = data.astype('float32')
+                data = data - 2**15
 
-        # Typically only need to be used with float32 data
-        if self.scale is not None:
-            data = data * self.scale
-        if self.shift is not None:
-            data = data + self.shift
+            # Typically only need to be used with float32 data
+            if self.scale is not None:
+                data = data * self.scale
+            if self.shift is not None:
+                data = data + self.shift
 
-        nsamp = data.shape[-1]
+            nsamp = data.shape[-1]
         X = torch.zeros((self.n_chan_bin, self.NT + 2*self.nt), device=self.device)
 
         with warnings.catch_warnings():
             # Don't need this, we know about the warning and it doesn't cause
             # any problems. Doing this the "correct" way is much slower.
             warnings.filterwarnings("ignore", message=_torch_warning)
+            if prefetch:
+                # Transpose on the GPU rather than on the CPU.
+                data = data.to(self.device).T.float()
+            else:
+                data = torch.from_numpy(data).to(self.device).float()
 
             # fix the data at the edges for the first and last batch
             if ibatch == 0:
-                X[:, self.nt : self.nt+nsamp] = torch.from_numpy(data).to(self.device).float()
+                X[:, self.nt : self.nt+nsamp] = data
                 X[:, :self.nt] = X[:, self.nt : self.nt+1]
                 bstart = self.imin - self.nt
             elif ibatch == self.n_batches-1:
-                X[:, :nsamp] = torch.from_numpy(data).to(self.device).float()
+                X[:, :nsamp] = data
                 X[:, nsamp:] = X[:, nsamp-1:nsamp]
                 bend += self.nt
             else:
-                X[:] = torch.from_numpy(data).to(self.device).float()
+                X[:] = data
 
         inds = [bstart, bend]
         if return_inds:
