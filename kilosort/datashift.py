@@ -219,9 +219,10 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
         return ops, None
     
     # the first step is to extract all spikes using the universal templates
+    # (their PC features are not needed for drift estimation)
     st, _, ops  = spikedetect.run(
         ops, bfile, device=device, progress_bar=progress_bar,
-        clear_cache=clear_cache, verbose=verbose
+        clear_cache=clear_cache, verbose=verbose, return_features=False
         )
 
     # spikes are binned by amplitude and y-position to construct a "fingerprint" for each batch
