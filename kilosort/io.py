@@ -259,7 +259,8 @@ def select_shank(probe, shank_idx):
 
 def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
                 data_dtype=None, save_extra_vars=False,
-                save_preprocessed_copy=False, skip_dat_path=False):
+                save_preprocessed_copy=False, skip_dat_path=False,
+                on_refract=None):
     """Save sorting results to disk in a format readable by Phy.
 
     Parameters
@@ -301,8 +302,13 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
         has an unexpected format, like when using a `file_object` loaded from
         an external data format through SpikeInterface. The full filename(s) will
         still be included in `params.py` for reference, but will be commented out.
+    on_refract : callable; optional.
+        Called as `on_refract(spike_clusters, is_ref, spike_positions)` (all
+        after duplicate removal) as soon as the refractory labels are known,
+        before the slower template and PC feature exports. Used to start the
+        spike position plot early.
 
-    
+
     Returns
     -------
     results_dir : pathlib.Path.
@@ -385,6 +391,17 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     log_performance(logger, level='debug', header='save_to_phy, remove duplicates',
                     reset=True)
 
+    # contamination ratio
+    acg_threshold = ops['settings']['acg_threshold']
+    ccg_threshold = ops['settings']['ccg_threshold']
+    is_ref, est_contam_rate = CCG.refract(spike_clusters, spike_times / ops['fs'],
+                                          acg_threshold=acg_threshold,
+                                          ccg_threshold=ccg_threshold)
+    log_performance(logger, level='debug', header='save_to_phy, est contam',
+                    reset=True)
+    if on_refract is not None:
+        on_refract(spike_clusters, is_ref, spike_positions)
+
     # template properties
     similar_templates = CCG.similarity(Wall, ops['wPCA'].contiguous(), nt=ops['nt'])
     template_amplitudes = torch.norm(Wall, dim=[-2,-1]).cpu().numpy()
@@ -410,15 +427,6 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     np.save(results_dir / 'pc_features.npy', pc_features)
     np.save(results_dir / 'pc_feature_ind.npy', pc_feature_ind)
     log_performance(logger, level='debug', header='save_to_phy, pc features',
-                    reset=True)
-
-    # contamination ratio
-    acg_threshold = ops['settings']['acg_threshold']
-    ccg_threshold = ops['settings']['ccg_threshold']
-    is_ref, est_contam_rate = CCG.refract(spike_clusters, spike_times / ops['fs'],
-                                          acg_threshold=acg_threshold,
-                                          ccg_threshold=ccg_threshold)
-    log_performance(logger, level='debug', header='save_to_phy, est contam',
                     reset=True)
 
     # write properties to *.tsv

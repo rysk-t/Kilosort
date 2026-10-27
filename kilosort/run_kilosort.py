@@ -310,13 +310,17 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
         log_thread_count(logger)
 
         logger.info('Generating diagnostic plots ...')
+        diagnostic_plots = None
         if gui_sorter is not None:
             gui_sorter.Wall0 = Wall0
             gui_sorter.wPCA = torch.clone(ops['wPCA'].cpu()).numpy()
             gui_sorter.clu0 = clu0
             gui_sorter.plotDataReady.emit('diagnostics')
         else:
-            kplots.plot_diagnostics(Wall0, clu0, ops, results_dir)
+            # Drawn in a separate process while sorting continues.
+            diagnostic_plots = kplots.BackgroundDiagnostics(
+                Wall0, clu0, ops, results_dir
+                )
 
         clu, Wall, st, tF = cluster_spikes(
             st, tF, ops, device, bfile, tic0=tic0, progress_bar=progress_bar,
@@ -325,27 +329,39 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         log_thread_count(logger)
 
+        # Draw the spike position plot in a separate process, started as
+        # soon as the refractory labels are known, while the rest of the
+        # export runs.
+        position_plot = []
+        def start_position_plot(spike_clusters, is_ref, spike_positions):
+            if gui_sorter is None:
+                logger.info('Generating spike position plot ...')
+                position_plot.append(kplots.BackgroundSpikePositions(
+                    spike_clusters, is_ref, spike_positions, results_dir
+                    ))
+
         ops, similar_templates, is_ref, est_contam_rate, kept_spikes = \
             save_sorting(
                 ops, results_dir, st, clu, tF, Wall, bfile.imin, tic0,
                 save_extra_vars=save_extra_vars,
                 save_preprocessed_copy=save_preprocessed_copy,
-                skip_dat_path=(file_object is not None)
+                skip_dat_path=(file_object is not None),
+                on_refract=start_position_plot
                 )
         if torch.cuda.is_available():
             ops['cuda_postproc'] = torch.cuda.memory_stats(device)
 
         log_thread_count(logger)
 
-        logger.info('Generating spike position plot ...')
         if gui_sorter is not None:
+            logger.info('Generating spike position plot ...')
             gui_sorter.clu = clu[kept_spikes]
             gui_sorter.is_refractory = is_ref
             gui_sorter.plotDataReady.emit('probe')
         else:
-            if drift_plots is not None:
-                drift_plots.wait()
-            kplots.plot_spike_positions(clu[kept_spikes], is_ref, results_dir)
+            for p in [drift_plots, diagnostic_plots] + position_plot:
+                if p is not None:
+                    p.wait()
         logger.info('Sorting finished.')
         log_sorting_summary(ops, log=logger, level='info')
         
@@ -958,7 +974,7 @@ def cluster_spikes(st, tF, ops, device, bfile, tic0=np.nan, progress_bar=None,
 
 def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
                  save_extra_vars=False, save_preprocessed_copy=False,
-                 skip_dat_path=False):  
+                 skip_dat_path=False, on_refract=None):
     """Save sorting results, and format them for use with Phy
 
     Parameters
@@ -997,6 +1013,8 @@ def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
         has an unexpected format, like when using a `file_object` loaded from
         an external data format through SpikeInterface. The full filename(s) will
         still be included in `params.py` for reference, but will be commented out.
+    on_refract : callable; optional.
+        Passed to `kilosort.io.save_to_phy`.
 
     Returns
     -------
@@ -1032,7 +1050,7 @@ def save_sorting(ops, results_dir, st, clu, tF, Wall, imin, tic0=np.nan,
             st, clu, tF, Wall, ops['probe'], ops, imin, results_dir=results_dir,
             data_dtype=ops['data_dtype'], save_extra_vars=save_extra_vars,
             save_preprocessed_copy=save_preprocessed_copy,
-            skip_dat_path=skip_dat_path
+            skip_dat_path=skip_dat_path, on_refract=on_refract
             )
     logger.info(f'{int(is_ref.sum())} units found with good refractory periods')
     

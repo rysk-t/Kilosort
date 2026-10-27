@@ -76,22 +76,33 @@ def plot_drift_scatter(st0, results_dir, tmin=0):
     plt.close(fig)
 
 
+def _diagnostics_data(Wall0, ops):
+    """The arrays drawn by `plot_diagnostics`, computed on Wall0's device."""
+    wPCA = ops['wPCA'].cpu().numpy()
+    features = torch.linalg.norm(Wall0, dim=2).cpu().numpy()
+    mean_amp = torch.linalg.norm(Wall0, dim=(1,2)).cpu().numpy()
+    return wPCA, features, mean_amp
+
+
 def plot_diagnostics(Wall0, clu0, ops, results_dir):
+    wPCA, features, mean_amp = _diagnostics_data(Wall0, ops)
+    _draw_diagnostics(wPCA, features, mean_amp, clu0, ops['settings']['fs'],
+                      results_dir)
+
+
+def _draw_diagnostics(wPCA, features, mean_amp, clu0, fs, results_dir):
     plt.style.use('dark_background')
     fig, axes = plt.subplots(2, 2, figsize=(16,16))
-    wPCA = ops['wPCA']
-    settings = ops['settings']
 
     # Top left
-    t = np.arange(wPCA.shape[1])/(settings['fs']/1000)
+    t = np.arange(wPCA.shape[1])/(fs/1000)
     for i in range(wPCA.shape[0]):
         color = COLOR_CODES[i % len(COLOR_CODES)]
-        axes[0][0].plot(t, wPCA[i,:].cpu().numpy(), c=color)
+        axes[0][0].plot(t, wPCA[i,:], c=color)
     axes[0][0].set_xlabel('Time (s)')
     axes[0][0].set_title('Temporal Features')
 
     # Top right
-    features = torch.linalg.norm(Wall0, dim=2).cpu().numpy()
     axes[0][1].imshow(features.T, aspect='auto', vmin=0, vmax=25, cmap='binary_r')
     axes[0][1].set_xlabel('Channel Number')
     axes[0][1].set_ylabel('Unit Number')
@@ -102,7 +113,6 @@ def plot_diagnostics(Wall0, clu0, ops, results_dir):
     spike_counts = np.zeros(n_units)
     for i in range(n_units):
         spike_counts[i] = (clu0[clu0 == i]).size
-    mean_amp = torch.linalg.norm(Wall0, dim=(1,2)).cpu().numpy()
 
     # Bottom left
     axes[1][0].plot(mean_amp)
@@ -123,7 +133,7 @@ def plot_diagnostics(Wall0, clu0, ops, results_dir):
     plt.close(fig)
 
 
-def plot_spike_positions(clu, is_refractory, results_dir):
+def plot_spike_positions(clu, is_refractory, results_dir, positions=None):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(1, 1, figsize=(30,14))
 
@@ -142,7 +152,8 @@ def plot_spike_positions(clu, is_refractory, results_dir):
         colors[subset] = rgba
 
     # Get x, y positions, add to scatterplot
-    positions = np.load(results_dir / 'spike_positions.npy')
+    if positions is None:
+        positions = np.load(results_dir / 'spike_positions.npy')
     xs, ys = positions[:,0], positions[:,1]
     ax.scatter(ys, xs, s=3, c=colors)
     ax.set_xlabel('Depth (um)', fontsize=22)
@@ -156,34 +167,27 @@ def plot_spike_positions(clu, is_refractory, results_dir):
     plt.close(fig)
 
 
-class BackgroundDriftPlots:
-    """Draw the drift plots in a separate Python process.
+class _BackgroundPlots:
+    """Call a function of this module in a separate Python process.
 
-    `plot_drift_amount` and `plot_drift_scatter` take ~20 s for long
-    recordings, during which the GPU would sit idle. They are drawn by a
-    fresh interpreter (``python -c ...``, not multiprocessing) so that user
-    scripts without an ``if __name__ == '__main__'`` guard are never
-    re-imported. Call `wait()` before reading the png files.
+    The plots for long recordings take tens of seconds, during which the GPU
+    would sit idle. They are drawn by a fresh interpreter (``python -c ...``,
+    not multiprocessing) so that user scripts without an
+    ``if __name__ == '__main__'`` guard are never re-imported. Call `wait()`
+    before reading the png files.
     """
 
-    def __init__(self, ops, st0, results_dir, tmin=0):
+    def __init__(self, func_name, args, what):
         import pickle, subprocess, sys, tempfile
         from pathlib import Path
-        dshift = ops['dshift']
-        if torch.is_tensor(dshift):
-            dshift = dshift.cpu().numpy()
-        mini_ops = {
-            'dshift': np.asarray(dshift),
-            'settings': {'fs': ops['settings']['fs'],
-                         'batch_size': ops['settings']['batch_size']},
-            }
-        fd, self._args_path = tempfile.mkstemp(suffix='.pkl', prefix='ks_drift_')
+        self._what = what
+        fd, self._args_path = tempfile.mkstemp(suffix='.pkl', prefix='ks_plot_')
         with open(fd, 'wb') as f:
-            pickle.dump((mini_ops, st0, Path(results_dir), tmin), f)
+            pickle.dump(args, f)
         pkg_parent = str(Path(__file__).resolve().parents[1])
         code = (f'import sys; sys.path.insert(0, {pkg_parent!r}); '
-                'from kilosort.plots import _drift_plots_from_file; '
-                f'_drift_plots_from_file({self._args_path!r})')
+                f'from kilosort.plots import {func_name}; '
+                f'{func_name}({self._args_path!r})')
         env = dict(os.environ, MPLBACKEND='Agg')
         self._proc = subprocess.Popen(
             [sys.executable, '-c', code], env=env,
@@ -202,9 +206,48 @@ class BackgroundDriftPlots:
             pass
         if code != 0:
             raise RuntimeError(
-                'Drift plots failed in background process:\n'
+                f'{self._what} failed in background process:\n'
                 + err.decode(errors='replace')
                 )
+
+
+class BackgroundDriftPlots(_BackgroundPlots):
+    """`plot_drift_amount` and `plot_drift_scatter` in a separate process."""
+
+    def __init__(self, ops, st0, results_dir, tmin=0):
+        from pathlib import Path
+        dshift = ops['dshift']
+        if torch.is_tensor(dshift):
+            dshift = dshift.cpu().numpy()
+        mini_ops = {
+            'dshift': np.asarray(dshift),
+            'settings': {'fs': ops['settings']['fs'],
+                         'batch_size': ops['settings']['batch_size']},
+            }
+        super().__init__('_drift_plots_from_file',
+                         (mini_ops, st0, Path(results_dir), tmin), 'Drift plots')
+
+
+class BackgroundDiagnostics(_BackgroundPlots):
+    """`plot_diagnostics` in a separate process (norms computed here)."""
+
+    def __init__(self, Wall0, clu0, ops, results_dir):
+        from pathlib import Path
+        wPCA, features, mean_amp = _diagnostics_data(Wall0, ops)
+        super().__init__('_diagnostics_from_file',
+                         (wPCA, features, mean_amp, np.asarray(clu0),
+                          ops['settings']['fs'], Path(results_dir)),
+                         'Diagnostic plots')
+
+
+class BackgroundSpikePositions(_BackgroundPlots):
+    """`plot_spike_positions` in a separate process."""
+
+    def __init__(self, clu, is_refractory, positions, results_dir):
+        from pathlib import Path
+        super().__init__('_spike_positions_from_file',
+                         (clu, is_refractory, positions, Path(results_dir)),
+                         'Spike position plot')
 
 
 def _drift_plots_from_file(path):
@@ -213,3 +256,17 @@ def _drift_plots_from_file(path):
         mini_ops, st0, results_dir, tmin = pickle.load(f)
     plot_drift_amount(mini_ops, results_dir, tmin=tmin)
     plot_drift_scatter(st0, results_dir, tmin=tmin)
+
+
+def _diagnostics_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        args = pickle.load(f)
+    _draw_diagnostics(*args)
+
+
+def _spike_positions_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        clu, is_refractory, positions, results_dir = pickle.load(f)
+    plot_spike_positions(clu, is_refractory, results_dir, positions=positions)
