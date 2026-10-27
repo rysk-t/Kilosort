@@ -9,24 +9,7 @@ import torch
 from kilosort import spikedetect
 
 
-def bin_spikes(ops, st):
-    """ for each batch, the spikes in that batch are binned to a 2D matrix by amplitude and depth
-    """
-
-    # the bin edges are based on min and max of channel y positions
-    ymin = ops['yc'].min()
-    ymax = ops['yc'].max()
-    dd = ops['binning_depth'] # binning width in depth
-    
-    # start 1um below the lowest channel
-    dmin = ymin-1
-
-    # dmax is how many bins to use
-    dmax = 1 + np.ceil((ymax-dmin)/dd).astype('int32')
-
-    Nbatches = ops['Nbatches']
-    
-    batch_id = st[:,4].copy()
+def _bin_spikes_per_batch(st, batch_id, Nbatches, dmin, dmax, dd, ops):
 
     # always use 20 bins for amplitude binning
     F = np.zeros((Nbatches, dmax, 20))
@@ -56,6 +39,47 @@ def bin_spikes(ops, st):
 
         # the 2D histogram counts are transformed to logarithm
         F[t] = np.log2(1+M.todense())
+
+    return F
+
+
+def bin_spikes(ops, st):
+    """ for each batch, the spikes in that batch are binned to a 2D matrix by amplitude and depth
+    """
+
+    # the bin edges are based on min and max of channel y positions
+    ymin = ops['yc'].min()
+    ymax = ops['yc'].max()
+    dd = ops['binning_depth'] # binning width in depth
+    
+    # start 1um below the lowest channel
+    dmin = ymin-1
+
+    # dmax is how many bins to use
+    dmax = 1 + np.ceil((ymax-dmin)/dd).astype('int32')
+
+    Nbatches = ops['Nbatches']
+    
+    batch_id = st[:,4].copy()
+
+    # Bin all batches at once with a single bincount instead of selecting
+    # each batch's spikes with a full scan of `st`. Same counts, same
+    # float64 log2 transform.
+    keep = (batch_id >= 0) & (batch_id < Nbatches) & (batch_id == np.round(batch_id))
+    sst = st[keep]
+    dep = sst[:,1] - dmin
+    amp = np.log10(np.minimum(99, sst[:,2])) - np.log10(ops['Th_universal'])
+    amp = amp / (np.log10(100)-np.log10(ops['Th_universal']))
+    rows = (dep/dd).astype('int32')
+    cols = (1e-5 + amp * 20).astype('int32')
+    if rows.size == 0 or (rows.min() >= 0 and rows.max() < dmax
+                          and cols.min() >= 0 and cols.max() < 20):
+        flat = (sst[:,4].astype(np.int64) * dmax + rows) * 20 + cols
+        counts = np.bincount(flat, minlength=Nbatches * dmax * 20)
+        F = np.log2(1 + counts.reshape(Nbatches, dmax, 20).astype(np.float64))
+    else:
+        # Out-of-range bins: keep the original per-batch path (and its errors).
+        F = _bin_spikes_per_batch(st, batch_id, Nbatches, dmin, dmax, dd, ops)
 
     # center of each vertical sampling bin
     ysamp = dmin + dd * np.arange(dmax) - dd/2
