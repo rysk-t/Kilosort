@@ -14,6 +14,7 @@ import torch
 from torch.fft import fft, ifft, fftshift
 
 from kilosort import CCG
+from kilosort.fused_preprocessing import channel_median
 from kilosort.preprocessing import get_drift_matrix, fft_highpass
 from kilosort.postprocessing import (
     remove_duplicates, compute_spike_positions, make_pc_features
@@ -1049,6 +1050,15 @@ class BinaryFiltered(BinaryRWFile):
         self.invert_sign=invert_sign
         self.artifact_threshold = artifact_threshold
 
+    def _fft_highpass(self, NT):
+        # The filter's FFT only depends on its length, so compute it once
+        # instead of once per batch.
+        cached = self.__dict__.get('_fwav')
+        if cached is None or cached[0] is not self.hp_filter or cached[1] != NT:
+            cached = (self.hp_filter, NT, fft_highpass(self.hp_filter, NT=NT))
+            self._fwav = cached
+        return cached[2]
+
     def filter(self, X, ops=None, ibatch=None, skip_preproc=False):
         # pick only the channels specified in the chanMap
         if self.chan_map is not None:
@@ -1060,14 +1070,14 @@ class BinaryFiltered(BinaryRWFile):
         X = X - X.mean(1).unsqueeze(1)
         if self.do_CAR:
             # remove the mean of each channel, and the median across channels
-            X = X - torch.median(X, 0)[0]
-    
+            X = X - channel_median(X)
+
         if skip_preproc:
             return X
 
         # high-pass filtering in the Fourier domain (much faster than filtfilt etc)
         if self.hp_filter is not None:
-            fwav = fft_highpass(self.hp_filter, NT=X.shape[1])
+            fwav = self._fft_highpass(X.shape[1])
             X = torch.real(ifft(fft(X) * torch.conj(fwav)))
             X = fftshift(X, dim = -1)
 
