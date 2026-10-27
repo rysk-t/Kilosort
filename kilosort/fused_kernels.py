@@ -947,13 +947,18 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
 
     with _stream():
         for t in range(max_peels):
-            if t == 0:
+            # Only the columns around the spikes of the last peel changed, but
+            # when there are many spikes their (overlapping) windows cover
+            # more columns than the full pass, which is then cheaper. Both
+            # paths use the same per-column device functions.
+            if t == 0 or nsp * nwB >= NT:
                 cfmax(gridT, (tpb,), (_p(B), _p(nm), _p(Cfmax), _p(imax), *_i32(NU, NT, nt)))
-                pool(gridT, (tpb,), (_p(Cfmax), _p(Cmax), _p(mask), *_i32(NT, nt), th2, eps))
             else:
-                # Only the columns around the spikes of the last peel changed.
                 cfmax_dirty((nsp,), (nwB,), (_p(B), _p(nm), _p(Cfmax), _p(imax), _p(st),
                                              *_i32(k - nsp, NU, NT, nt)))
+            if t == 0 or nsp * (2 * nwB - 1) >= NT:
+                pool(gridT, (tpb,), (_p(Cfmax), _p(Cmax), _p(mask), *_i32(NT, nt), th2, eps))
+            else:
                 pool_dirty((nsp,), (2 * nwB - 1,), (_p(Cfmax), _p(Cmax), _p(mask), _p(st),
                                                     *_i32(k - nsp, NT, nt), th2, eps))
             compact((1,), (_CTPB,), (_p(mask), _p(imax), _p(B), _p(nm), _p(Cmax),
