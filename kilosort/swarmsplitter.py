@@ -8,10 +8,16 @@ def count_elements(kk, iclust, my_clus, xtree):
     n2 = np.isin(iclust, my_clus[xtree[kk, 1]]).sum()
     return n1, n2
 
-def check_split(Xd, kk, xtree, iclust, my_clus):
-    ixy = np.isin(iclust, my_clus[xtree[kk, 2]])
-    iclu = iclust[ixy]
-    labels = 2*np.isin(iclu, my_clus[xtree[kk, 0]]) - 1
+def check_split(Xd, kk, xtree, iclust, my_clus, ix1=None, ix2=None):
+    if ix1 is None or ix2 is None:
+        ixy = np.isin(iclust, my_clus[xtree[kk, 2]])
+        iclu = iclust[ixy]
+        labels = 2*np.isin(iclu, my_clus[xtree[kk, 0]]) - 1
+    else:
+        # The two children partition the parent. Reuse their masks while
+        # preserving the original spike order in the regression inputs.
+        ixy = ix1 | ix2
+        labels = 2*ix1[ixy] - 1
 
     Xs = Xd[ixy]
     Xs[:,-1] = 1
@@ -97,24 +103,23 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
         if not valid_merge[kk]:
             continue;
 
+        # This criterion cannot merge the node, so no spike masks or other
+        # tests are needed. The old verbose-only mask sums were unused.
+        if tstat[kk,0] < 0.2:
+            continue
+
         ix1 = np.isin(iclust, my_clus[xtree[kk, 0]])
         ix2 = np.isin(iclust, my_clus[xtree[kk, 1]])
 
         criterion = 0
         score = np.nan
-        if criterion==0:
-            # first mutation is global modularity
-            if tstat[kk,0] < 0.2:
-                criterion = -1
-
-
         if meta is not None and criterion==0:
             # second mutation is based on meta_data
             criterion = refractoriness(meta[ix1],meta[ix2])
             #criterion = 0
         
         if criterion==0:
-            xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
+            xproj, score = check_split(Xd, kk, xtree, iclust, my_clus, ix1, ix2)
             # third mutation is bimodality
             #xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
             criterion = 2 * (score <  .6) - 1
@@ -123,11 +128,6 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
             # fourth mutation is local modularity (not reachable)
             score = tstat[kk,-1]
             criterion = score > .15
-
-        if verbose:
-            n1,n2 = ix1.sum(), ix2.sum()
-            #print('%3.0d, %6.0d, %6.0d, %6.0d, %2.2f,%4.2f, %2.2f'%(kk, n1, n2,n1+n2,
-            #tstat[kk,0], tstat[kk,-1], score))
 
         if criterion==1:
             valid_merge[kk] = 0
