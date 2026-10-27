@@ -2,7 +2,8 @@ import os
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
+# torch is imported inside the functions that need it, so that the
+# background plotting processes (see _BackgroundPlots) do not load it.
 
 
 COLOR_CODES = ['b', 'g', 'r', 'c', 'm', 'y', 'k', 'w']
@@ -78,6 +79,7 @@ def plot_drift_scatter(st0, results_dir, tmin=0):
 
 def _diagnostics_data(Wall0, ops):
     """The arrays drawn by `plot_diagnostics`, computed on Wall0's device."""
+    import torch
     wPCA = ops['wPCA'].cpu().numpy()
     features = torch.linalg.norm(Wall0, dim=2).cpu().numpy()
     mean_amp = torch.linalg.norm(Wall0, dim=(1,2)).cpu().numpy()
@@ -137,19 +139,13 @@ def plot_spike_positions(clu, is_refractory, results_dir, positions=None):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(1, 1, figsize=(30,14))
 
-    # 10 colors in palette, last one is gray for non-frefractory
-    clu = clu.copy()
+    # 10 colors in palette, last one is gray for non-frefractory.
+    # Map cluster ids to palette indices through a lookup table instead of
+    # scanning all spikes once per color.
     bad_units = np.unique(clu)[is_refractory == 0]
-    bad_idx = np.isin(clu, bad_units)
-    clu = np.mod(clu, 9)
-    clu[bad_idx] = 9
-    colors = np.empty((clu.shape[0], 4), dtype=float)
-
-    # Map modded cluster ids to colors
-    for i in range(10):
-        subset = (clu == i)
-        rgba = PROBE_PLOT_COLORS[i]
-        colors[subset] = rgba
+    palette_idx = np.mod(np.arange(int(clu.max()) + 1), 9)
+    palette_idx[bad_units] = 9
+    colors = PROBE_PLOT_COLORS[palette_idx[clu]]
 
     # Get x, y positions, add to scatterplot
     if positions is None:
@@ -173,8 +169,10 @@ class _BackgroundPlots:
     The plots for long recordings take tens of seconds, during which the GPU
     would sit idle. They are drawn by a fresh interpreter (``python -c ...``,
     not multiprocessing) so that user scripts without an
-    ``if __name__ == '__main__'`` guard are never re-imported. Call `wait()`
-    before reading the png files.
+    ``if __name__ == '__main__'`` guard are never re-imported. The
+    interpreter loads this file directly rather than the kilosort package,
+    whose import pulls in torch and CUDA (several seconds on Windows) that
+    the plots don't need. Call `wait()` before reading the png files.
     """
 
     def __init__(self, func_name, args, what):
@@ -184,10 +182,10 @@ class _BackgroundPlots:
         fd, self._args_path = tempfile.mkstemp(suffix='.pkl', prefix='ks_plot_')
         with open(fd, 'wb') as f:
             pickle.dump(args, f)
-        pkg_parent = str(Path(__file__).resolve().parents[1])
-        code = (f'import sys; sys.path.insert(0, {pkg_parent!r}); '
-                f'from kilosort.plots import {func_name}; '
-                f'{func_name}({self._args_path!r})')
+        code = ('import importlib.util as u; '
+                f's = u.spec_from_file_location("kilosort_plots", {__file__!r}); '
+                'm = u.module_from_spec(s); s.loader.exec_module(m); '
+                f'm.{func_name}({self._args_path!r})')
         env = dict(os.environ, MPLBACKEND='Agg')
         self._proc = subprocess.Popen(
             [sys.executable, '-c', code], env=env,
@@ -216,6 +214,7 @@ class BackgroundDriftPlots(_BackgroundPlots):
 
     def __init__(self, ops, st0, results_dir, tmin=0):
         from pathlib import Path
+        import torch
         dshift = ops['dshift']
         if torch.is_tensor(dshift):
             dshift = dshift.cpu().numpy()
