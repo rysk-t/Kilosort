@@ -146,11 +146,15 @@ def _replay_graph(step, n):
         return
     g = torch.cuda.CUDAGraph()
     # Same as `with torch.cuda.graph(g, capture_error_mode='thread_local')`,
-    # minus the gc.collect() / empty_cache() that older PyTorch versions run
-    # on every capture (~0.1 s each, for hundreds of captures per sort).
+    # minus the gc.collect() that older PyTorch versions run on every capture
+    # (~0.1 s each, for hundreds of captures per sort).
     # thread_local: don't fail because of other threads (e.g. the CPU-only
     # prefetch thread in `run`) while capturing.
     torch.cuda.synchronize()
+    # The graph allocates from its own memory pool, which can't reuse blocks
+    # cached by the eager iterations; release them first so peak GPU memory
+    # stays the same as without graphs.
+    torch.cuda.empty_cache()
     capture_stream = torch.cuda.Stream()
     with torch.cuda.stream(capture_stream):
         g.capture_begin(capture_error_mode='thread_local')
