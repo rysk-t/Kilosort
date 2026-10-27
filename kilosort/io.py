@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 from scipy.io import loadmat
 import numpy as np
 import torch
-from torch.fft import fft, ifft, fftshift
+from torch.fft import fft, ifft, fftshift, rfft, irfft
 
 from kilosort import CCG
 from kilosort.fused_preprocessing import channel_median
@@ -23,6 +23,25 @@ from kilosort.utils import log_performance
 
 _torch_warning = ".*PyTorch does not support non-writable tensors"
 _prefetch_executor = None
+
+
+def fast_approx():
+    """True if KILOSORT_FAST_APPROX=1: allow faster computations whose
+    results differ slightly from the default ones (not bit-identical)."""
+    return os.environ.get('KILOSORT_FAST_APPROX', '0') == '1'
+
+
+def _fast_fft_length(n):
+    """Smallest 2**a * 3**b >= n."""
+    best = 1 << (n - 1).bit_length()
+    p3 = 1
+    while p3 < best:
+        m = p3
+        while m < n:
+            m *= 2
+        best = min(best, m)
+        p3 *= 3
+    return best
 
 
 def _prefetch_pool():
@@ -878,8 +897,10 @@ class BinaryRWFile:
             # any problems. Doing this the "correct" way is much slower.
             warnings.filterwarnings("ignore", message=_torch_warning)
             if prefetch:
-                # Transpose on the GPU rather than on the CPU.
-                data = data.to(self.device).T.float()
+                # Transpose on the GPU rather than on the CPU. The buffer is
+                # pinned memory from PyTorch's caching host allocator, which
+                # keeps it alive until the asynchronous copy is done.
+                data = data.to(self.device, non_blocking=True).T.float()
             else:
                 data = torch.from_numpy(data).to(self.device).float()
 
@@ -1067,6 +1088,29 @@ class BinaryFiltered(BinaryRWFile):
             self._fwav = cached
         return cached[2]
 
+    def _highpass_padded(self, X):
+        """High-pass filter with real FFTs of a fast length (KILOSORT_FAST_APPROX).
+
+        The default path filters each batch circularly with complex FFTs of
+        length NT + 2*nt, which has a large prime factor (60122 = 2*23*1307)
+        and runs as a slow Bluestein transform. Here the batch is zero-padded
+        to the next 2**a * 3**b length instead. Away from the batch edges the
+        result is the same up to rounding; within ~300 samples of each edge
+        the zero padding replaces the circular wrap-around.
+        """
+        NT = X.shape[1]
+        cached = self.__dict__.get('_fwav_padded')
+        if cached is None or cached[0] is not self.hp_filter or cached[1] != NT:
+            N = _fast_fft_length(NT)
+            L = self.hp_filter.shape[0]
+            h = torch.zeros(N, device=self.hp_filter.device)
+            h[:L] = self.hp_filter
+            h = torch.roll(h, -(L//2))
+            cached = (self.hp_filter, NT, N, torch.conj(rfft(h)))
+            self._fwav_padded = cached
+        N, fh = cached[2], cached[3]
+        return irfft(rfft(X, n=N) * fh, n=N)[:, :NT].contiguous()
+
     def filter(self, X, ops=None, ibatch=None, skip_preproc=False):
         # pick only the channels specified in the chanMap
         if self.chan_map is not None:
@@ -1085,9 +1129,12 @@ class BinaryFiltered(BinaryRWFile):
 
         # high-pass filtering in the Fourier domain (much faster than filtfilt etc)
         if self.hp_filter is not None:
-            fwav = self._fft_highpass(X.shape[1])
-            X = torch.real(ifft(fft(X) * torch.conj(fwav)))
-            X = fftshift(X, dim = -1)
+            if fast_approx() and self.hp_filter.shape[0] <= X.shape[1]:
+                X = self._highpass_padded(X)
+            else:
+                fwav = self._fft_highpass(X.shape[1])
+                X = torch.real(ifft(fft(X) * torch.conj(fwav)))
+                X = fftshift(X, dim = -1)
 
         if self.artifact_threshold < np.inf:
             if torch.any(torch.abs(X) >= self.artifact_threshold):
