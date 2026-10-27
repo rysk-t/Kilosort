@@ -6,7 +6,7 @@ import torch
 from kilosort.clustering_qr import xy_templates, get_data_cpu
 
 
-@njit("(int64[:], int32[:], int32)")
+@njit("(int64[:], int32[:], int32)", cache=True)
 def remove_duplicates(spike_times, spike_clusters, dt=15):
     '''Removes same-cluster spikes that occur within `dt` samples.'''
     keep = np.zeros_like(spike_times, bool_)

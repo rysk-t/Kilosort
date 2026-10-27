@@ -5,7 +5,7 @@ from torch.nn.functional import conv1d
 import math 
 from tqdm import trange 
 
-@njit()
+@njit(cache=True)
 def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500):
 
     st1 = np.sort(st1)
