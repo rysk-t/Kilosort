@@ -13,8 +13,8 @@ import numpy as np
 import torch
 from torch.fft import fft, ifft, fftshift, rfft, irfft
 
-from kilosort import CCG
-from kilosort.fused_preprocessing import channel_median
+from kilosort import CCG, fused_kernels
+from kilosort.fused_preprocessing import load_batch, subtract_mean_and_median
 from kilosort.preprocessing import get_drift_matrix, fft_highpass
 from kilosort.postprocessing import (
     remove_duplicates, compute_spike_positions, make_pc_features
@@ -1126,18 +1126,24 @@ class BinaryFiltered(BinaryRWFile):
         N, fh = cached[2], cached[3]
         return irfft(rfft(X, n=N) * fh, n=N)[:, :NT].contiguous()
 
-    def filter(self, X, ops=None, ibatch=None, skip_preproc=False):
-        # pick only the channels specified in the chanMap
-        if self.chan_map is not None:
-            X = X[self.chan_map]
+    def filter(self, X, ops=None, ibatch=None, skip_preproc=False,
+               selected=False):
+        # `selected`: X already has only the chanMap channels, sign-inverted
+        # if needed (see _loaded_batch).
+        if not selected:
+            # pick only the channels specified in the chanMap
+            if self.chan_map is not None:
+                X = X[self.chan_map]
 
-        if self.invert_sign:
-            X = X * -1
+            if self.invert_sign:
+                X = X * -1
 
-        X = X - X.mean(1).unsqueeze(1)
+        mean = X.mean(1)
         if self.do_CAR:
             # remove the mean of each channel, and the median across channels
-            X = X - channel_median(X)
+            X = subtract_mean_and_median(X, mean)
+        else:
+            X = X - mean.unsqueeze(1)
 
         if skip_preproc:
             return X
@@ -1178,12 +1184,47 @@ class BinaryFiltered(BinaryRWFile):
         
     def padded_batch_to_torch(self, ibatch, ops=None, return_inds=False,
                               skip_preproc=False):
-        if return_inds:
-            X, inds = super().padded_batch_to_torch(ibatch, return_inds=return_inds)
-            return self.filter(X, ops, ibatch, skip_preproc=skip_preproc), inds
+        if (self._can_prefetch() and self.chan_map is not None
+                and fused_kernels.enabled()):
+            X, inds = self._loaded_batch(ibatch)
+            X = self.filter(X, ops, ibatch, skip_preproc=skip_preproc,
+                            selected=True)
         else:
-            X = super().padded_batch_to_torch(ibatch)
-            return self.filter(X, ops, ibatch, skip_preproc=skip_preproc)
+            X, inds = super().padded_batch_to_torch(ibatch, return_inds=True)
+            X = self.filter(X, ops, ibatch, skip_preproc=skip_preproc)
+        if return_inds:
+            return X, inds
+        return X
+
+    def _loaded_batch(self, ibatch):
+        """`BinaryRWFile.padded_batch_to_torch` + chanMap + sign inversion.
+
+        The raw int16 batch goes to the GPU as stored in the file and one
+        kernel transposes it, selects the chanMap channels and pads the
+        edges, instead of several full-size float copies.
+        """
+        ibatch *= self.batch_downsampling
+        raw, bstart, bend = self._prefetched_batch(ibatch)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=_torch_warning)
+            raw = raw.to(self.device, non_blocking=True)
+        cm = self.__dict__.get('_chan_map_gpu')
+        if cm is None or cm[0] is not self.chan_map:
+            cm = (self.chan_map, torch.as_tensor(np.asarray(self.chan_map),
+                                                 dtype=torch.int64,
+                                                 device=self.device))
+            self._chan_map_gpu = cm
+        first = ibatch == 0
+        last = not first and ibatch == self.n_batches - 1
+        X = load_batch(raw, cm[1], int(self.NT + 2*self.nt),
+                       int(self.nt) if first else 0, first, last,
+                       self.invert_sign)
+        # fix the indices at the edges for the first and last batch
+        if first:
+            bstart = self.imin - self.nt
+        elif last:
+            bend += self.nt
+        return X, [bstart, bend]
 
 
 def save_preprocessing(filename, ops, bfile=None, bfile_path=None, verbose=False):
