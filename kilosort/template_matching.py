@@ -6,6 +6,7 @@ from torch.nn.functional import conv1d, max_pool2d, max_pool1d
 from tqdm import tqdm
 
 from kilosort import CCG, fused_kernels
+from kilosort.spikedetect import grow_buffer
 from kilosort.utils import log_performance
 
 logger = logging.getLogger(__name__)
@@ -94,17 +95,22 @@ def extract(ops, bfile, U, device=torch.device('cuda'), progress_bar=None):
                 amps = amps[~neg_spikes,:]
                 th_amps = th_amps[~neg_spikes,:]
 
-            nsp = len(stt) 
-            if k+nsp>st.shape[0]:                     
-                st = np.concatenate((st, np.zeros_like(st)), 0)
-                tF  = torch.cat((tF,  torch.zeros_like(tF)), 0)
+            nsp = len(stt)
+            if k+nsp>st.shape[0]:
+                st = grow_buffer(st, k+nsp, ibatch, bfile.n_batches)
+                tF = grow_buffer(tF, k+nsp, ibatch, bfile.n_batches)
 
+            # The three columns are assembled on the GPU (float64, the same
+            # operations as before) and copied back in one go.
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size'])
             stt = stt.double()
-            st[k:k+nsp,0] = ((stt[:,0]-nt) + t_shift).cpu().numpy() - nt//2 + ops['nt0min']
-            st[k:k+nsp,1] = stt[:,1].cpu().numpy()
-            st[k:k+nsp,2] = th_amps.cpu().numpy().squeeze()
-            
+            cols = torch.stack([
+                ((stt[:,0]-nt) + t_shift) - nt//2 + ops['nt0min'],
+                stt[:,1],
+                th_amps[:,0].double(),
+                ], 1)
+            st[k:k+nsp] = cols.cpu().numpy()
+
             tF[k:k+nsp]  = xfeat.transpose(0,1).cpu()
 
             k+= nsp
