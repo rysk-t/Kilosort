@@ -24,6 +24,7 @@ the kernels are bit-identical on that data.
 import logging
 import os
 import warnings
+import weakref
 
 import numpy as np
 import torch
@@ -312,6 +313,76 @@ void as_kernel(ptr_t pB, ptr_t pw, ptr_t piC, ptr_t pAs, int NT, int F)
     As[(long long)f * NT + t] = a_max(B, w, ch, NT, t, &bq, &bval);
 }
 
+// Same as as_kernel for a block of G_ adjacent templates x TL_ time samples:
+// the B values of the union of their nearest channels (UMAX at most) are
+// staged in shared memory once, each thread then handles one template and
+// TT_ = 4 consecutive samples (float4 reads) with the weights in registers.
+#ifdef G_
+extern "C" __global__ void __launch_bounds__(G_ * TL_ / TT_)
+as_tile_kernel(ptr_t pB, ptr_t pw, ptr_t pumap, ptr_t puch, ptr_t pAs, int NT, int F, int UMAX)
+{
+    const float* B = (const float*)pB;           // (C, NK, NT)
+    const float* weigh = (const float*)pw;       // (S, NC, F)
+    const int* umap = (const int*)pumap;         // (ngroups, G_, NC): index into the union
+    const int* uch = (const int*)puch;           // (ngroups, UMAX): channel ids, -1 = none
+    float* As = (float*)pAs;                     // (F, NT)
+    extern __shared__ float4 sh4[];
+    float* sB = (float*)sh4;                     // UMAX * NK * TL_
+    const int g = blockIdx.x;
+    const int f0 = g * G_;
+    const int t0 = blockIdx.y * TL_;
+    const int tid = threadIdx.x;
+    const int NTHR = G_ * TL_ / TT_;
+    for (int k = tid; k < UMAX * NK * TL_; k += NTHR) {
+        int u = k / (NK * TL_), r = k % (NK * TL_);
+        int l = r / TL_, tt = r % TL_;
+        int c = uch[(long long)g * UMAX + u];
+        int t = t0 + tt;
+        sB[k] = (c >= 0 && t < NT) ? B[((long long)c * NK + l) * NT + t] : 0.0f;
+    }
+    __syncthreads();
+    const int lane = tid / (TL_ / TT_);          // template within the group
+    const int tt = (tid % (TL_ / TT_)) * TT_;
+    const int f = f0 + lane;
+    const int t = t0 + tt;
+    if (f >= F || t >= NT) return;
+    float w[S * NC];
+    #pragma unroll
+    for (int k = 0; k < S * NC; ++k) w[k] = weigh[(long long)k * F + f];
+    int mp[NC];
+    #pragma unroll
+    for (int j = 0; j < NC; ++j) mp[j] = umap[((long long)g * G_ + lane) * NC + j];
+    float best[TT_];
+    #pragma unroll
+    for (int u = 0; u < TT_; ++u) best[u] = -1.0f;
+    #pragma unroll
+    for (int l = 0; l < NK; ++l) {
+        float b[NC][TT_];
+        #pragma unroll
+        for (int j = 0; j < NC; ++j) {
+            float4 v4 = *(const float4*)(sB + (mp[j] * NK + l) * TL_ + tt);
+            b[j][0] = v4.x; b[j][1] = v4.y; b[j][2] = v4.z; b[j][3] = v4.w;
+        }
+        #pragma unroll
+        for (int s = 0; s < S; ++s) {
+            #pragma unroll
+            for (int u = 0; u < TT_; ++u) {
+                // same summation order as a_max
+                float a0 = 0.0f, a1 = 0.0f;
+                #pragma unroll
+                for (int j = 0; j < NC / 2; ++j) a0 = fmaf(w[s * NC + j], b[j][u], a0);
+                #pragma unroll
+                for (int j = NC / 2; j < NC; ++j) a1 = fmaf(w[s * NC + j], b[j][u], a1);
+                float v = fabsf(a0 + a1);
+                best[u] = fmaxf(best[u], v);
+            }
+        }
+    }
+    #pragma unroll
+    for (int u = 0; u < TT_; ++u) if (t + u < NT) As[(long long)f * NT + t + u] = best[u];
+}
+#endif
+
 // imax[s] = (1 + q) * sign(A[q]) at the detected (f, t) = xy[s]
 extern "C" __global__
 void imax_kernel(ptr_t pB, ptr_t pw, ptr_t piC, ptr_t pxy, ptr_t pim, int NT, int F, int n)
@@ -359,14 +430,17 @@ void qpool_kernel(ptr_t pAs, ptr_t pQ, int NT, int nt, int nt0)
     Q[(long long)f * NT + t] = m;
 }
 
-// mask[f, t] = As[f, t] > th && As[f, t] == max_n Q[iC2[n, f], t]
+// Appends (f, t) to list (in no particular order; sorted on the host) where
+// As[f, t] > th && As[f, t] == max_n Q[iC2[n, f], t]
 extern "C" __global__
-void cand_kernel(ptr_t pAs, ptr_t pQ, ptr_t piC2, ptr_t pmask, int NT, int F, int N2, float th)
+void cand_kernel(ptr_t pAs, ptr_t pQ, ptr_t piC2, ptr_t plist, ptr_t pcount,
+                 int NT, int F, int N2, float th, int cap)
 {
     const float* As = (const float*)pAs;
     const float* Q = (const float*)pQ;
     const long long* iC2 = (const long long*)piC2;
-    bool* mask = (bool*)pmask;
+    int* list = (int*)plist;
+    int* count = (int*)pcount;
     const int f = blockIdx.x;
     const int t = blockIdx.y * blockDim.x + threadIdx.x;
     extern __shared__ int nb[];
@@ -384,9 +458,43 @@ void cand_kernel(ptr_t pAs, ptr_t pQ, ptr_t piC2, ptr_t pmask, int NT, int F, in
         }
         ok = (m == v);
     }
-    mask[(long long)f * NT + t] = ok;
+    if (ok) {
+        int i = atomicAdd(count, 1);
+        if (i < cap) { list[2 * i] = f; list[2 * i + 1] = t; }
+    }
 }
 """
+
+
+_TILE_G, _TILE_TL, _TILE_TT = 16, 32, 4
+_groups_cache = {}
+
+
+def _template_groups(iC, iC_l, G):
+    """For each group of G consecutive templates: the union of their nearest
+    channels (-1 padded, (ngroups, UMAX)) and, per template and nearest
+    channel, the index into that union ((ngroups, G, NC)). Cached for the
+    iC tensor of the current run."""
+    hit = _groups_cache.get('hit')
+    if hit is not None and hit[0]() is iC and hit[1] == G:
+        return hit[2]
+    iCt = iC_l.t().cpu().numpy()                      # (F, NC)
+    F, NC = iCt.shape
+    ng = (F + G - 1) // G
+    unions, maps = [], np.zeros((ng, G, NC), np.int32)
+    for g in range(ng):
+        block = iCt[g * G:(g + 1) * G]
+        u, inv = np.unique(block, return_inverse=True)
+        unions.append(u)
+        maps[g, :len(block)] = inv.reshape(block.shape)
+    umax = max(len(u) for u in unions)
+    uch = -np.ones((ng, umax), np.int32)
+    for g, u in enumerate(unions):
+        uch[g, :len(u)] = u
+    payload = (torch.from_numpy(maps).to(iC_l.device),
+               torch.from_numpy(uch).to(iC_l.device), umax, ng)
+    _groups_cache['hit'] = (weakref.ref(iC), G, payload)
+    return payload
 
 
 def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
@@ -418,27 +526,59 @@ def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
 
     As = torch.empty((Nfilt, NT), device=device)
     Q = torch.empty((Nfilt, NT), device=device)
-    mask = torch.empty((Nfilt, NT), dtype=torch.bool, device=device)
+    cap = 1 << 18
+    clist = torch.empty((cap, 2), dtype=torch.int32, device=device)
+    count = torch.zeros(1, dtype=torch.int32, device=device)
     weigh = weigh.contiguous()
     iC_l = iC.long().contiguous()
     iC2_l = iC2.long().contiguous()
     th = np.float32(ops['Th_universal'])
 
-    as_kernel = _function('template_match', 'as_kernel', consts)
     qpool_kernel = _function('template_match', 'qpool_kernel', consts)
     cand_kernel = _function('template_match', 'cand_kernel', consts)
     imax_kernel = _function('template_match', 'imax_kernel', consts)
     ntile = (NT + tpb - 1) // tpb
+    # The tiled kernel needs the B values of the union of the nearest channels
+    # of G adjacent templates in shared memory; fall back to the one-thread-
+    # per-(template, time) kernel if that does not fit.
+    G, TL, TT = _TILE_G, _TILE_TL, _TILE_TT
+    umap, uch, umax, ngroups = _template_groups(iC, iC_l, G)
+    smem = umax * nk * TL * 4
+    tiled = smem <= 96 * 1024
     with _stream():
-        as_kernel((Nfilt, ntile), (tpb,),
-                  (_p(B), _p(weigh), _p(iC_l), _p(As), *_i32(NT, Nfilt)))
+        if tiled:
+            as_tile = _function('template_match', 'as_tile_kernel',
+                                consts + (('G_', G), ('TL_', TL), ('TT_', TT)))
+            if smem > 48 * 1024:
+                as_tile.max_dynamic_shared_size_bytes = smem
+            as_tile((ngroups, (NT + TL - 1) // TL), (G * TL // TT,),
+                    (_p(B), _p(weigh), _p(umap), _p(uch), _p(As), *_i32(NT, Nfilt, umax)),
+                    shared_mem=smem)
+        else:
+            as_kernel = _function('template_match', 'as_kernel', consts)
+            as_kernel((Nfilt, ntile), (tpb,),
+                      (_p(B), _p(weigh), _p(iC_l), _p(As), *_i32(NT, Nfilt)))
         qpool_kernel((ntile, Nfilt), (tpb,), (_p(As), _p(Q), *_i32(NT, nt, nt0)),
                      shared_mem=(tpb + 2 * nt0) * 4)
         cand_kernel((Nfilt, ntile), (tpb,),
-                    (_p(As), _p(Q), _p(iC2_l), _p(mask), *_i32(NT, Nfilt, N2), th),
+                    (_p(As), _p(Q), _p(iC2_l), _p(clist), _p(count),
+                     *_i32(NT, Nfilt, N2), th, np.int32(cap)),
                     shared_mem=N2 * 4)
-    xy = mask.nonzero().contiguous()   # nonzero() returns a (1, n)-strided view
-    nsp = len(xy)
+    nsp = int(count.item())
+    while nsp > cap:
+        # more detections than the list holds: rerun with a large enough one
+        cap = nsp
+        clist = torch.empty((cap, 2), dtype=torch.int32, device=device)
+        count.zero_()
+        with _stream():
+            cand_kernel((Nfilt, ntile), (tpb,),
+                        (_p(As), _p(Q), _p(iC2_l), _p(clist), _p(count),
+                         *_i32(NT, Nfilt, N2), th, np.int32(cap)),
+                        shared_mem=N2 * 4)
+        nsp = int(count.item())
+    # same order as logical_and(...).nonzero(): row-major in (f, t)
+    xy = clist[:nsp].long()
+    xy = xy[(xy[:, 0] * NT + xy[:, 1]).argsort()].contiguous()
     imax = torch.empty(nsp, dtype=torch.int64, device=device)
     if nsp > 0:
         with _stream():
@@ -721,17 +861,19 @@ def _csr(nz):
 
 
 def _template_sparsity(U, ctc):
-    """Nonzero rows of ctc[:, y, :] and nonzero channels of U[y], cached per
-    (U, ctc) since they are the same for every batch of `extract`."""
-    key = (U.data_ptr(), tuple(U.shape), ctc.data_ptr(), tuple(ctc.shape))
-    hit = _sparsity_cache.get(key)
-    if hit is None:
-        rows, row0, LR = _csr((ctc != 0).any(-1))         # (NU rows, NU templates)
-        chans, ch0, LC = _csr((U != 0).any(1).t())        # (C channels, NU templates)
-        hit = (rows, row0, LR, chans, ch0, LC)
-        _sparsity_cache.clear()
-        _sparsity_cache[key] = hit
-    return hit
+    """Nonzero rows of ctc[:, y, :] and nonzero channels of U[y], cached for
+    the (U, ctc) tensors of the current `extract` since they are the same
+    for every batch. The cache holds weak references, so it is dropped as
+    soon as the tensors are, and a new tensor at the same address is never
+    mistaken for the old one."""
+    hit = _sparsity_cache.get('hit')
+    if hit is not None and hit[0]() is U and hit[1]() is ctc:
+        return hit[2]
+    rows, row0, LR = _csr((ctc != 0).any(-1))         # (NU rows, NU templates)
+    chans, ch0, LC = _csr((U != 0).any(1).t())        # (C channels, NU templates)
+    payload = (rows, row0, LR, chans, ch0, LC)
+    _sparsity_cache['hit'] = (weakref.ref(U), weakref.ref(ctc), payload)
+    return payload
 
 
 def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
