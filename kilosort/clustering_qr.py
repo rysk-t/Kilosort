@@ -127,6 +127,32 @@ def Mstats(M, device=torch.device('cuda')):
     return m, ki, kj
 
 
+# Number of iterations run normally before the rest of a loop is replayed
+# from a CUDA graph (the first iterations also warm up the caching allocator).
+_N_EAGER = 2
+
+
+def _replay_graph(step, n):
+    """Record one call of `step` as a CUDA graph and replay it `n` times.
+
+    The clustering loops launch many tiny kernels per iteration, so their
+    runtime is dominated by launch overhead. Recording does not execute
+    `step`, so the replays run exactly `n` iterations. `step` must update its
+    state in place, and its random draws come from the same generator state
+    as eager execution would (PyTorch handles the Philox offsets).
+    """
+    if n <= 0:
+        return
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        step()
+    for _ in range(n):
+        g.replay()
+    # Make sure the replays have finished before the graph is released.
+    torch.cuda.current_stream().synchronize()
+    del g
+
+
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
             nclust=200, seed=1, niter=200, lam=0, device=torch.device('cuda'),
             verbose=False):    
@@ -168,6 +194,19 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
         iclust_init = iclust.clone()
         
     for t in range(niter):
+        if device.type == 'cuda' and t == _N_EAGER:
+            # Replay the remaining iterations from a CUDA graph.
+            static_iclust = iclust.clone()
+            def step():
+                isub = assign_isub(static_iclust, kn, tones2, nclust, nsub, lam,
+                                   m, ki, kj, device=device)
+                static_iclust.copy_(assign_iclust(
+                    rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj,
+                    device=device
+                    ))
+            _replay_graph(step, niter - t)
+            iclust = static_iclust
+            break
         # given iclust, reassign isub
         isub = assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,
                            ki, kj,device=device)
@@ -242,51 +281,58 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     # We ask, if we were to add another centroid, which spikes would that
     # increase the explained variance for and by how much?
     # We use ntry candidates on each iteration.
-    for j in range(niter):
+    # The iteration number is kept on the GPU (jt) and all state is updated
+    # in place, so that one iteration can be replayed from a CUDA graph.
+    jt = torch.zeros((), dtype=torch.int, device=device)
+
+    def step():
         # v2 is the un-explained variance so far for each spike
         v2 = torch.relu(vtot - vexp0)
 
         # We sample ntry new candidate centroids based on how much un-explained variance they have
         # more unexplained variance makes it more likely to be selected
-        # Only one of these candidates will be added this iteration. 
+        # Only one of these candidates will be added this iteration.
         if subsample:
             isamp = rev_idx[_multinomial_noreplace(v2[idx], ntry)]
         else:
             isamp = _multinomial_noreplace(v2, ntry)
 
+        # The new centroids to be tested, sampled from the spikes in Xg.
+        Xc = Xg[isamp]
+        # Variance explained for each spike for the new centroids.
+        vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
+        # Difference between variance explained for new centroids
+        # and best explained variance so far across all iterations.
+        # This gets relu-ed, since only the positive increases will actually
+        # re-assign a spike to this new cluster
+        dexp = torch.relu(vexp - vexp0.unsqueeze(1))
+        # Sum all positive increases to determine additional explained variance
+        # for each candidate centroid.
+        vsum = dexp.sum(0)
+        # Pick the candidate which increases explained variance the most
+        imax = torch.argmax(vsum).view(1)
+
+        # For that centroid (Xc[imax]), determine which spikes actually get
+        # more variance from it.
+        # NOTE: torch.where instead of boolean-mask indexing, which syncs
+        #       with the GPU (nonzero) on every iteration.
+        ix = dexp.index_select(1, imax).squeeze(1) > 0
+
+        iclust.copy_(torch.where(ix, jt, iclust))    # assign new cluster identity
+        # spike features used as centroid for cluster j
+        mu.index_copy_(0, jt.view(1).long(), Xc.index_select(0, imax))
+        # Update variance explained for the spikes assigned to cluster j
+        vexp0.copy_(torch.where(ix, vexp.index_select(1, imax).squeeze(1), vexp0))
+        jt.add_(1)
+
+    # The subsampling path indexes with CPU arrays, which can't be captured.
+    use_graph = device.type == 'cuda' and not subsample
+    for j in range(niter):
         try:
-            # The new centroids to be tested, sampled from the spikes in Xg.
-            Xc = Xg[isamp]
-            # Variance explained for each spike for the new centroids.
-            vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
-            # Difference between variance explained for new centroids
-            # and best explained variance so far across all iterations.
-            # This gets relu-ed, since only the positive increases will actually
-            # re-assign a spike to this new cluster
-            dexp = torch.relu(vexp - vexp0.unsqueeze(1))
-            # Sum all positive increases to determine additional explained variance
-            # for each candidate centroid.
-            vsum = dexp.sum(0)
-            # Pick the candidate which increases explained variance the most 
-            imax = torch.argmax(vsum).view(1)
-
-            # For that centroid (Xc[imax]), determine which spikes actually get
-            # more variance from it.
-            # NOTE: masked_fill / where instead of boolean-mask indexing, which
-            #       syncs with the GPU (nonzero) on every iteration.
-            ix = dexp.index_select(1, imax).squeeze(1) > 0
-
-            iclust.masked_fill_(ix, j)    # assign new cluster identity
-            # spike features used as centroid for cluster j
-            mu[j] = Xc.index_select(0, imax).squeeze(0)
-            # Update variance explained for the spikes assigned to cluster j
-            vexp0 = torch.where(ix, vexp.index_select(1, imax).squeeze(1), vexp0)
-
-            # Delete large variables between iterations
-            # to prevent excessive memory reservation.
-            del(vexp)
-            del(dexp)
-
+            if use_graph and j == _N_EAGER:
+                _replay_graph(step, niter - j)
+                break
+            step()
         except torch.cuda.OutOfMemoryError:
             logger.debug(f"OOM in kmeans_plus_plus iter {j}, nsp: {Xg.shape[0]}, "
                          f"Xg size: {Xg.nbytes / (2**20):.2f} MB.")
