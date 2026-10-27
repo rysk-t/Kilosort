@@ -97,6 +97,10 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
 
     # xy: template centers, iC: channels associated with each template
     xy, iC = xy_templates(ops)
+    # Feature construction runs on the CPU. Copy these integer indices once
+    # instead of using a GPU tensor in every cluster's channel mapping.
+    if torch.is_tensor(iC):
+        iC = iC.cpu()
     n_templates = iC.shape[1]
     n_clusters = np.unique(spike_clusters).size
     n_chans = ops['nearest_chans']
