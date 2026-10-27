@@ -269,6 +269,13 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
     WtW = torch.flip(WtW, [2,])
 
+    # Spike indices of each cluster (ascending), kept up to date as clusters
+    # merge, so each lookup doesn't need a scan over all spikes (clu2 == kk).
+    nvals = max(NN, int(clu2.max()) + 1) if clu2.size else NN
+    order = np.argsort(clu2, kind='stable')
+    bounds = np.searchsorted(clu2[order], np.arange(nvals + 1))
+    members = [order[bounds[k]:bounds[k+1]] for k in range(nvals)]
+
     t = 0
     nmerge = 0
     while t<NN:
@@ -293,11 +300,13 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
 
         cmax, imax = ctc.max(1)
         cmax[kk] = 0
+        # Compare on the CPU: indexing a CUDA tensor element syncs every time.
+        cmax = cmax.cpu()
 
-        jsort = np.argsort(cmax.cpu().numpy())[::-1]
+        jsort = np.argsort(cmax.numpy())[::-1]
 
         if mode == 'ccg':
-            st0 = st[:,0][clu2==kk] / ops['fs']
+            st0 = st[:,0][members[kk]] / ops['fs']
         
         is_ccg  = 0
         for j in range(NN):
@@ -306,7 +315,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 break
             # compare with CCG
             if mode == 'ccg':
-                st1 = st[:,0][clu2==jj] / ops['fs']
+                st1 = st[:,0][members[jj]] / ops['fs']
                 _, is_ccg, _ = CCG.check_CCG(st0, st1, acg_threshold=acg_threshold,
                                              ccg_threshold=ccg_threshold)        
             else:
@@ -316,11 +325,11 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
             if is_ccg:
                 is_merged[jj] = 1
                 dt = (imax[kk] -imax[jj]).item()
+                # Get spike indices for cluster jj
+                idx = members[jj]
                 if dt != 0 and check_dt:
-                    # Get spike indices for cluster jj
-                    idx = (clu2 == jj)
                     # Update tF and Wall with shifted features
-                    tF, Wall = roll_features(W, tF, Ww, idx, jj, dt)
+                    tF, Wall = roll_features(W, tF, Ww, torch.from_numpy(idx), jj, dt)
                     # Shift spike times
                     st[idx,0] -= dt
                 
@@ -328,7 +337,9 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
                 Ww[jj] = 0
                 ns[kk] += ns[jj]
                 ns[jj] = 0
-                clu2[clu2==jj] = kk            
+                clu2[idx] = kk
+                members[kk] = np.sort(np.concatenate((members[kk], idx)))
+                members[jj] = idx[:0]
 
                 break
 
