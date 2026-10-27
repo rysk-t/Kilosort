@@ -1,3 +1,4 @@
+import os
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
@@ -153,3 +154,62 @@ def plot_spike_positions(clu, is_refractory, results_dir):
     fig.savefig(save_path, dpi=300)
     plt.style.use('default')
     plt.close(fig)
+
+
+class BackgroundDriftPlots:
+    """Draw the drift plots in a separate Python process.
+
+    `plot_drift_amount` and `plot_drift_scatter` take ~20 s for long
+    recordings, during which the GPU would sit idle. They are drawn by a
+    fresh interpreter (``python -c ...``, not multiprocessing) so that user
+    scripts without an ``if __name__ == '__main__'`` guard are never
+    re-imported. Call `wait()` before reading the png files.
+    """
+
+    def __init__(self, ops, st0, results_dir, tmin=0):
+        import pickle, subprocess, sys, tempfile
+        from pathlib import Path
+        dshift = ops['dshift']
+        if torch.is_tensor(dshift):
+            dshift = dshift.cpu().numpy()
+        mini_ops = {
+            'dshift': np.asarray(dshift),
+            'settings': {'fs': ops['settings']['fs'],
+                         'batch_size': ops['settings']['batch_size']},
+            }
+        fd, self._args_path = tempfile.mkstemp(suffix='.pkl', prefix='ks_drift_')
+        with open(fd, 'wb') as f:
+            pickle.dump((mini_ops, st0, Path(results_dir), tmin), f)
+        pkg_parent = str(Path(__file__).resolve().parents[1])
+        code = (f'import sys; sys.path.insert(0, {pkg_parent!r}); '
+                'from kilosort.plots import _drift_plots_from_file; '
+                f'_drift_plots_from_file({self._args_path!r})')
+        env = dict(os.environ, MPLBACKEND='Agg')
+        self._proc = subprocess.Popen(
+            [sys.executable, '-c', code], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+
+    def wait(self):
+        """Wait for the plots; raise if the plotting process failed."""
+        if self._proc is None:
+            return
+        _, err = self._proc.communicate()
+        code, self._proc = self._proc.returncode, None
+        try:
+            os.remove(self._args_path)
+        except OSError:
+            pass
+        if code != 0:
+            raise RuntimeError(
+                'Drift plots failed in background process:\n'
+                + err.decode(errors='replace')
+                )
+
+
+def _drift_plots_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        mini_ops, st0, results_dir, tmin = pickle.load(f)
+    plot_drift_amount(mini_ops, results_dir, tmin=tmin)
+    plot_drift_scatter(st0, results_dir, tmin=tmin)

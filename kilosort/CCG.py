@@ -109,9 +109,12 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
     cross_refractory = np.zeros(Nfilt, )
     R12 = np.zeros(Nfilt, )
 
+    # Group spike indices by cluster once (stable sort keeps each cluster's
+    # spikes in their original order) instead of scanning iclust2 per cluster.
+    order = np.argsort(iclust2, kind='stable')
+    bounds = np.searchsorted(iclust2[order], np.arange(Nfilt + 1))
     for kk in range(Nfilt):    
-        ix = iclust2==kk
-        st1 = st0[ix]
+        st1 = st0[order[bounds[kk]:bounds[kk+1]]]
 
         if (len(st1) > 10) and ((st1.max() - st1.min()) != 0):
             is_refractory[kk], cross_refractory[kk], R12[kk] = check_CCG(

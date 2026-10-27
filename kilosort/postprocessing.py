@@ -102,9 +102,16 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
     n_chans = ops['nearest_chans']
     feature_ind = np.zeros((n_clusters, n_chans), dtype=np.uint32)
 
-    for i in np.unique(spike_clusters):
+    # Group spikes by cluster once instead of scanning all spikes per cluster.
+    clusters = np.unique(spike_clusters)
+    corder = np.argsort(spike_clusters, kind='stable')
+    csorted = spike_clusters[corder]
+    starts = np.searchsorted(csorted, clusters, side='left')
+    ends = np.searchsorted(csorted, clusters, side='right')
+
+    for i, cs, ce in zip(clusters, starts, ends):
         # Get templates associated with cluster (often just 1)
-        iunq = np.unique(spike_templates[spike_clusters==i]).astype(int)
+        iunq = np.unique(spike_templates[corder[cs:ce]]).astype(int)
         # Get boolean mask with size (n_templates,), True if they match cluster
         ix = torch.from_numpy(np.zeros(n_templates, bool))
         ix[iunq] = True
