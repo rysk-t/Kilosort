@@ -13,6 +13,13 @@ the first call and only switches to the fused kernel if the outputs are
 bit-identical.
 
 Set the environment variable ``KILOSORT_FUSED_KERNELS=0`` to disable them.
+
+``KILOSORT_FUSED_VERIFY`` controls how many calls are checked against the
+PyTorch implementation: ``1`` (default) checks the first call of each kernel
+and silently falls back on a mismatch, an integer ``N`` checks the first N
+calls, and ``all`` checks every call. With an explicit setting a mismatch
+raises an error, so a full run with ``KILOSORT_FUSED_VERIFY=all`` proves that
+the kernels are bit-identical on that data.
 """
 import logging
 import os
@@ -26,41 +33,96 @@ logger = logging.getLogger(__name__)
 
 _state = {}
 
+_INSTALL_HINT = (
+    "Install CuPy with the CUDA headers matching PyTorch's CUDA version, e.g. "
+    "`pip install \"cupy-cuda12x[ctk]\"` or `pip install \"cupy-cuda13x[ctk]\"` "
+    "(torch.version.cuda = {cuda}). Without them Kilosort uses the slower "
+    "PyTorch code paths; set KILOSORT_FUSED_KERNELS=0 to silence this warning."
+    )
+
 
 def enabled():
     return os.environ.get('KILOSORT_FUSED_KERNELS', '1') != '0'
 
 
+def _verify_setting():
+    """(number of calls to verify, whether a mismatch is an error)."""
+    v = os.environ.get('KILOSORT_FUSED_VERIFY')
+    if v is None:
+        return 1, False
+    v = v.strip().lower()
+    if v == 'all':
+        return float('inf'), True
+    try:
+        return int(v), True
+    except ValueError:
+        logger.warning(f'Ignoring KILOSORT_FUSED_VERIFY={v!r} (expected an '
+                       'integer or "all"); verifying the first call only.')
+        return 1, False
+
+
+def _describe_mismatch(ref, new):
+    if len(ref) != len(new):
+        return f'{len(ref)} vs {len(new)} outputs'
+    parts = []
+    for i, (a, b) in enumerate(zip(ref, new)):
+        if a.shape != b.shape or a.dtype != b.dtype:
+            parts.append(f'output {i}: {tuple(a.shape)} {a.dtype} vs '
+                         f'{tuple(b.shape)} {b.dtype}')
+        elif not torch.equal(a, b):
+            n = int((a != b).sum())
+            parts.append(f'output {i}: {n} of {a.numel()} elements differ')
+    return '; '.join(parts)
+
+
 def verified_call(key, reference, fused, *args, **kwargs):
     """Call `fused` instead of `reference` once it has been checked.
 
-    On the first call both are run and the reference output is returned.
-    Later calls use `fused` only if the first outputs were bit-identical;
+    On the first call(s) both are run and the reference output is returned.
+    Later calls use `fused` only if the checked outputs were bit-identical;
     any exception from the fused path (e.g. CuPy not installed) also falls
-    back to `reference`.
+    back to `reference`. See the module docstring for KILOSORT_FUSED_VERIFY.
     """
-    state = _state.setdefault(key, {'checked': False, 'use_fused': False})
-    if not state['checked']:
-        state['checked'] = True
+    state = _state.setdefault(key, {'n_checked': 0, 'use_fused': None})
+    n_verify, strict = _verify_setting()
+    if state['use_fused'] is None and state['n_checked'] >= n_verify:
+        # n_verify == 0: use the fused kernel without checking it.
+        state['use_fused'] = True
+    if state['use_fused'] is None:
         ref = reference(*args, **kwargs)
         try:
             new = fused(*args, **kwargs)
-            same = (len(ref) == len(new)
-                    and all(torch.equal(a, b) for a, b in zip(ref, new)))
         except Exception as e:
-            logger.info(f'Fused kernel for {key} unavailable ({e!r}), '
-                        'using the PyTorch implementation.')
+            state['use_fused'] = False
+            cuda = getattr(torch.version, 'cuda', None)
+            logger.warning(f'Fused CUDA kernel for {key} unavailable ({e!r}); '
+                           'using the PyTorch implementation. '
+                           + _INSTALL_HINT.format(cuda=cuda))
             return ref
-        state['use_fused'] = same
-        if same:
-            logger.info(f'Fused kernel for {key} verified on first call.')
-        else:
-            logger.warning(f'Fused kernel for {key} does not match the PyTorch '
-                           'implementation, using the PyTorch implementation.')
+        state['n_checked'] += 1
+        same = (len(ref) == len(new)
+                and all(torch.equal(a, b) for a, b in zip(ref, new)))
+        if not same:
+            msg = (f'Fused kernel for {key} does not match the PyTorch '
+                   f'implementation on call {state["n_checked"]}: '
+                   f'{_describe_mismatch(ref, new)}.')
+            if strict:
+                raise RuntimeError(msg)
+            state['use_fused'] = False
+            logger.warning(msg + ' Using the PyTorch implementation.')
+        elif state['n_checked'] >= n_verify:
+            state['use_fused'] = True
+            logger.info(f'Fused kernel for {key} verified on '
+                        f'{state["n_checked"]} call(s).')
         return ref
     if state['use_fused']:
         return fused(*args, **kwargs)
     return reference(*args, **kwargs)
+
+
+def reset_verification():
+    """Forget the verification results (e.g. after changing the kernels)."""
+    _state.clear()
 
 
 _modules = {}
