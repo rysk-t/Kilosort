@@ -145,10 +145,19 @@ def _replay_graph(step, n):
     if n <= 0:
         return
     g = torch.cuda.CUDAGraph()
+    # Same as `with torch.cuda.graph(g, capture_error_mode='thread_local')`,
+    # minus the gc.collect() / empty_cache() that older PyTorch versions run
+    # on every capture (~0.1 s each, for hundreds of captures per sort).
     # thread_local: don't fail because of other threads (e.g. the CPU-only
     # prefetch thread in `run`) while capturing.
-    with torch.cuda.graph(g, capture_error_mode='thread_local'):
-        step()
+    torch.cuda.synchronize()
+    capture_stream = torch.cuda.Stream()
+    with torch.cuda.stream(capture_stream):
+        g.capture_begin(capture_error_mode='thread_local')
+        try:
+            step()
+        finally:
+            g.capture_end()
     for _ in range(n):
         g.replay()
     # Make sure the replays have finished before the graph is released.
