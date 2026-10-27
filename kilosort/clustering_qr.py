@@ -66,21 +66,30 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     return kn, M
 
 
+def _counts(idx, n, like):
+    # Same as coo((zeros, idx), ones, (1, n)).to_dense(). Adding 1.0 is exact,
+    # so the order of the atomic adds doesn't matter. scatter_add_ is used
+    # instead of bincount because bincount syncs with the GPU to size its output.
+    c = torch.zeros(n, dtype=like.dtype, device=like.device)
+    c.scatter_add_(0, idx.long(), torch.ones(idx.shape[0], dtype=like.dtype,
+                                             device=like.device))
+    return c.unsqueeze(0)
+
+
 def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=torch.device('cuda')):
     n_spikes = kn.shape[0]
+    nclust = int(nclust)
 
-    ij = torch.vstack((rows_neigh.flatten(), isub[kn].flatten()))
-    xN = coo(ij, tones2.flatten(), (n_spikes, nclust))
-    xN = xN.to_dense()
+    # Dense version of coo((rows_neigh, isub[kn]), tones2).to_dense(), built
+    # directly with scatter_add_ (same values, far fewer kernels).
+    xN = torch.zeros(n_spikes * nclust, dtype=tones2.dtype, device=tones2.device)
+    xN.scatter_add_(0, (rows_neigh * nclust + isub[kn]).flatten(), tones2.flatten())
+    xN = xN.view(n_spikes, nclust)
 
     if lam > 0:
-        tones = torch.ones(len(kj), device = device)
-        tzeros = torch.zeros(len(kj), device = device)
-        ij = torch.vstack((tzeros, isub))    
-        kN = coo(ij, tones, (1, nclust))
-    
-        xN = xN - lam/m * (ki.unsqueeze(-1) * kN.to_dense()) 
-    
+        kN = _counts(isub, nclust, tones2)
+        xN = xN - lam/m * (ki.unsqueeze(-1) * kN)
+
     iclust = torch.argmax(xN, 1)
 
     return iclust
@@ -88,18 +97,17 @@ def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=t
 
 def assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,ki,kj, device=torch.device('cuda')):
     n_neigh = kn.shape[1]
+    nclust = int(nclust)
     cols = iclust.unsqueeze(-1).tile((1, n_neigh))
-    iis = torch.vstack((kn.flatten(), cols.flatten()))
 
-    xS = coo(iis, tones2.flatten(), (nsub, nclust))
-    xS = xS.to_dense()
+    # Dense version of coo((kn, cols), tones2).to_dense(), see assign_iclust.
+    xS = torch.zeros(nsub * nclust, dtype=tones2.dtype, device=tones2.device)
+    xS.scatter_add_(0, (kn * nclust + cols).flatten(), tones2.flatten())
+    xS = xS.view(nsub, nclust)
 
     if lam > 0:
-        tones = torch.ones(len(ki), device = device)
-        tzeros = torch.zeros(len(ki), device = device)
-        ij = torch.vstack((tzeros, iclust))    
-        kN = coo(ij, tones, (1, nclust))
-        xS = xS - lam / m * (kj.unsqueeze(-1) * kN.to_dense())
+        kN = _counts(iclust, nclust, tones2)
+        xS = xS - lam / m * (kj.unsqueeze(-1) * kN)
 
     isub = torch.argmax(xS, 1)
     return isub
@@ -180,6 +188,21 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
     return iclust, isub, M, iclust_init
 
 
+def _multinomial_noreplace(p, n):
+    """Same draws as torch.multinomial(p, n, replacement=False).
+
+    torch.multinomial samples without replacement by drawing exponential
+    noise q, then taking topk(p / q). It also validates `p` with several
+    .item() calls, which forces a GPU sync on every call. This does the same
+    sampling (same RNG consumption, same result) without the validation.
+    Unlike torch.multinomial it does not raise if `p` has fewer than `n`
+    non-zero entries.
+    """
+    q = torch.empty_like(p).exponential_(1)
+    q = p / q
+    return torch.topk(q, n).indices
+
+
 def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=False):
     # Xg is number of spikes by number of features.
     # We are finding cluster centroids and assigning each spike to a centroid.
@@ -226,9 +249,9 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
         # more unexplained variance makes it more likely to be selected
         # Only one of these candidates will be added this iteration. 
         if subsample:
-            isamp = rev_idx[torch.multinomial(v2[idx], ntry)]
+            isamp = rev_idx[_multinomial_noreplace(v2[idx], ntry)]
         else:
-            isamp = torch.multinomial(v2, ntry)
+            isamp = _multinomial_noreplace(v2, ntry)
 
         try:
             # The new centroids to be tested, sampled from the spikes in Xg.
@@ -244,16 +267,19 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
             # for each candidate centroid.
             vsum = dexp.sum(0)
             # Pick the candidate which increases explained variance the most 
-            imax = torch.argmax(vsum)
+            imax = torch.argmax(vsum).view(1)
 
             # For that centroid (Xc[imax]), determine which spikes actually get
-            # more variance from it
-            ix = dexp[:, imax] > 0
+            # more variance from it.
+            # NOTE: masked_fill / where instead of boolean-mask indexing, which
+            #       syncs with the GPU (nonzero) on every iteration.
+            ix = dexp.index_select(1, imax).squeeze(1) > 0
 
-            iclust[ix] = j    # assign new cluster identity
-            mu[j] = Xc[imax]  # spike features used as centroid for cluster j
+            iclust.masked_fill_(ix, j)    # assign new cluster identity
+            # spike features used as centroid for cluster j
+            mu[j] = Xc.index_select(0, imax).squeeze(0)
             # Update variance explained for the spikes assigned to cluster j
-            vexp0[ix] = vexp[ix, imax]
+            vexp0 = torch.where(ix, vexp.index_select(1, imax).squeeze(1), vexp0)
 
             # Delete large variables between iterations
             # to prevent excessive memory reservation.
