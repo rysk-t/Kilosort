@@ -200,45 +200,53 @@ void conv_kernel(ptr_t px, ptr_t pw, ptr_t po, int C, int NT)
         float acc = 0.0f;
         #pragma unroll
         for (int i = 0; i < NTAP; ++i) acc = fmaf(ws[k * NTAP + i], xs[threadIdx.x + i], acc);
+#if KMAJOR
+        o[((long long)k * C + c) * NT + t] = acc;
+#else
         o[((long long)c * K + k) * NT + t] = acc;
+#endif
     }
 }
 """
 
 
-def _conv1d_torch(X, W, padding):
-    return conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=padding)
+def _conv1d_torch(X, W, padding, kmajor=False):
+    out = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=padding)
+    return out.permute(1, 0, 2) if kmajor else out
 
 
-def _conv1d_fused(X, W, padding):
+def _conv1d_fused(X, W, padding, kmajor=False):
     X = X.contiguous()
     W = W.contiguous()
     C, NT = X.shape
     K, NTAP = W.shape
     if X.dtype != torch.float32 or W.dtype != torch.float32 or K > 16 or NTAP > 255:
         raise ValueError('unsupported shape or dtype for fused conv1d')
-    out = torch.empty((C, K, NT), device=X.device)
+    out = torch.empty((K, C, NT) if kmajor else (C, K, NT), device=X.device)
     tpb = 256
     kern = _function('conv', 'conv_kernel',
-                     (('K', K), ('NTAP', NTAP), ('PAD', padding), ('TPB', tpb)))
+                     (('K', K), ('NTAP', NTAP), ('PAD', padding), ('TPB', tpb),
+                      ('KMAJOR', int(bool(kmajor)))))
     with _stream():
         kern(((NT + tpb - 1) // tpb, C), (tpb,), (_p(X), _p(W), _p(out), *_i32(C, NT)))
     return out
 
 
 # verified_call expects tuples of tensors
-def _conv1d_torch_t(X, W, padding):
-    return (_conv1d_torch(X, W, padding),)
+def _conv1d_torch_t(X, W, padding, kmajor=False):
+    return (_conv1d_torch(X, W, padding, kmajor),)
 
 
-def _conv1d_fused_t(X, W, padding):
-    return (_conv1d_fused(X, W, padding),)
+def _conv1d_fused_t(X, W, padding, kmajor=False):
+    return (_conv1d_fused(X, W, padding, kmajor),)
 
 
-def conv1d_templates(X, W, padding):
-    """conv1d(X.unsqueeze(1), W.unsqueeze(1), padding) as (C, K, NT), with the
-    fused kernel once it has been verified bit-identical to cuDNN."""
-    return verified_call('conv1d', _conv1d_torch_t, _conv1d_fused_t, X, W, padding)[0]
+def conv1d_templates(X, W, padding, kmajor=False):
+    """conv1d(X.unsqueeze(1), W.unsqueeze(1), padding) as (C, K, NT), or as
+    (K, C, NT) with `kmajor` (contiguous when the fused kernel is used), with
+    the fused kernel once it has been verified bit-identical to cuDNN."""
+    return verified_call('conv1d', _conv1d_torch_t, _conv1d_fused_t,
+                         X, W, padding, kmajor)[0]
 
 
 # --------------------------------------------------------------------------
@@ -748,8 +756,12 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
 
     nm = (U**2).sum(-1).sum(-1)
 
-    B = conv1d_templates(X, W, nt//2)
-    B = torch.einsum('ijk, kjl -> il', U, B)
+    # einsum('ijk, kjl -> il', U, conv1d(X, W)) permutes the conv output to
+    # (j, k, l) and runs this matmul; producing it in that layout directly
+    # saves the copy and rounds the same way.
+    B = conv1d_templates(X, W, nt//2, kmajor=True)
+    NU = U.shape[0]
+    B = U.reshape(NU, -1) @ B.reshape(-1, B.shape[-1])
 
     capacity = 100000
     st = torch.zeros((capacity,2), dtype = torch.int64, device = device)
