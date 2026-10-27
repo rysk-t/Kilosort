@@ -16,6 +16,7 @@ Set the environment variable ``KILOSORT_FUSED_KERNELS=0`` to disable them.
 """
 import logging
 import os
+import warnings
 
 import numpy as np
 import torch
@@ -74,8 +75,15 @@ def _function(src_name, name):
 
 
 def _stream():
+    """CuPy view of PyTorch's current CUDA stream."""
     import cupy as cp
-    return cp.cuda.Stream.from_external(torch.cuda.current_stream())
+    stream = torch.cuda.current_stream()
+    if hasattr(stream, '__cuda_stream__'):
+        return cp.cuda.Stream.from_external(stream)
+    # Older PyTorch (< 2.6 or so) doesn't implement the CUDA stream protocol.
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', DeprecationWarning)
+        return cp.cuda.ExternalStream(stream.cuda_stream)
 
 
 def _p(t):
