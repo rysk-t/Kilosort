@@ -976,9 +976,10 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
                 m = (nsp - j + 1) // 2
                 if m == 0:
                     continue
-                # Same call as the PyTorch version, so the waveforms have the
-                # same cuBLAS rounding.
-                E = torch.einsum('ijk, jl -> kil', U[iY[j::2,0]], W)
+                # einsum('ijk, jl -> kil', U[iY], W) permutes U[iY] to (i, k, j)
+                # and runs this batched matmul (same cuBLAS call, same
+                # rounding) with ~25 us less host overhead per call.
+                E = (U[iY[j::2,0]].permute(0, 2, 1) @ W).permute(1, 0, 2)
                 e0, e1, e2 = E.stride()
                 if not overlap:
                     upd((m, LR + LC), (tpb_upd,),
