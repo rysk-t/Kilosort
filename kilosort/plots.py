@@ -135,7 +135,7 @@ def _draw_diagnostics(wPCA, features, mean_amp, clu0, fs, results_dir):
     plt.close(fig)
 
 
-def plot_spike_positions(clu, is_refractory, results_dir, positions=None):
+def _spike_positions_figure(clu, is_refractory, positions):
     plt.style.use('dark_background')
     fig, ax = plt.subplots(1, 1, figsize=(30,14))
 
@@ -148,19 +148,68 @@ def plot_spike_positions(clu, is_refractory, results_dir, positions=None):
     colors = PROBE_PLOT_COLORS[palette_idx[clu]]
 
     # Get x, y positions, add to scatterplot
-    if positions is None:
-        positions = np.load(results_dir / 'spike_positions.npy')
     xs, ys = positions[:,0], positions[:,1]
-    ax.scatter(ys, xs, s=3, c=colors)
+    points = ax.scatter(ys, xs, s=3, c=colors)
     ax.set_xlabel('Depth (um)', fontsize=22)
     ax.set_ylabel('Lateral (um)', fontsize=22)
     fig.suptitle('Spike position across probe, colored by cluster', fontsize=30)
     fig.tight_layout()
 
+    return fig, ax, points, colors
+
+
+def plot_spike_positions(clu, is_refractory, results_dir, positions=None):
+    if positions is None:
+        positions = np.load(results_dir / 'spike_positions.npy')
+    fig, _, _, _ = _spike_positions_figure(clu, is_refractory, positions)
+
     save_path = results_dir / 'spike_positions.png'
-    fig.savefig(save_path, dpi=300)
+    fig.savefig(save_path, dpi=_POSITIONS_DPI)
     plt.style.use('default')
     plt.close(fig)
+
+
+_POSITIONS_DPI = 300
+# Pixels added on each side of a strip when selecting the spikes to draw in
+# it; must exceed the marker radius plus antialiasing (about 7 px at dpi 300).
+_STRIP_MARGIN = 20
+
+
+def _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out):
+    """Pixel columns of strip `k` of the spike position plot.
+
+    The figure is set up exactly as in `plot_spike_positions` (all spikes,
+    so the axis limits and layout are the same), then only the markers that
+    reach into this strip are kept, in their original order. Every pixel of
+    the strip is covered by the same markers, blended in the same order, as
+    in the full plot, so the strips put side by side give the same image.
+    """
+    import io as _io
+    fig, ax, points, colors = _spike_positions_figure(clu, is_refractory, positions)
+    ax.set_xlim(ax.get_xlim())
+    ax.set_ylim(ax.get_ylim())
+    W = int(round(fig.get_figwidth() * _POSITIONS_DPI))
+    H = int(round(fig.get_figheight() * _POSITIONS_DPI))
+    xy = np.column_stack((positions[:,1], positions[:,0]))
+    px = (ax.transData + fig.transFigure.inverted()).transform(xy)[:,0] * W
+
+    # Strip edges at quantiles of the marker columns, so that each strip
+    # draws about the same number of markers.
+    finite = px[np.isfinite(px)]
+    inner = np.quantile(finite, np.arange(1, n_strips) / n_strips) if finite.size else []
+    edges = np.concatenate(([0], np.clip(np.round(inner), 0, W), [W])).astype(int)
+    edges = np.maximum.accumulate(edges)
+    c0, c1 = edges[k], edges[k+1]
+
+    keep = (px >= c0 - _STRIP_MARGIN) & (px < c1 + _STRIP_MARGIN)
+    points.set_offsets(xy[keep])
+    points.set_facecolor(colors[keep])
+    buf = _io.BytesIO()
+    fig.savefig(buf, format='raw', dpi=_POSITIONS_DPI)
+    plt.style.use('default')
+    plt.close(fig)
+    image = np.frombuffer(buf.getvalue(), np.uint8).reshape(H, W, 4)
+    np.save(out, image[:, c0:c1])
 
 
 class _BackgroundPlots:
@@ -175,17 +224,22 @@ class _BackgroundPlots:
     the plots don't need. Call `wait()` before reading the png files.
     """
 
-    def __init__(self, func_name, args, what):
+    def __init__(self, func_name, args, what, args_path=None, call_args=()):
         import pickle, subprocess, sys, tempfile
-        from pathlib import Path
         self._what = what
-        fd, self._args_path = tempfile.mkstemp(suffix='.pkl', prefix='ks_plot_')
-        with open(fd, 'wb') as f:
-            pickle.dump(args, f)
+        # With `args_path`, the arguments were pickled by the caller, who
+        # also removes the file.
+        self._owns_args = args_path is None
+        if args_path is None:
+            fd, args_path = tempfile.mkstemp(suffix='.pkl', prefix='ks_plot_')
+            with open(fd, 'wb') as f:
+                pickle.dump(args, f)
+        self._args_path = args_path
+        call = ', '.join(repr(a) for a in (args_path,) + tuple(call_args))
         code = ('import importlib.util as u; '
                 f's = u.spec_from_file_location("kilosort_plots", {__file__!r}); '
                 'm = u.module_from_spec(s); s.loader.exec_module(m); '
-                f'm.{func_name}({self._args_path!r})')
+                f'm.{func_name}({call})')
         env = dict(os.environ, MPLBACKEND='Agg')
         self._proc = subprocess.Popen(
             [sys.executable, '-c', code], env=env,
@@ -198,10 +252,11 @@ class _BackgroundPlots:
             return
         _, err = self._proc.communicate()
         code, self._proc = self._proc.returncode, None
-        try:
-            os.remove(self._args_path)
-        except OSError:
-            pass
+        if self._owns_args:
+            try:
+                os.remove(self._args_path)
+            except OSError:
+                pass
         if code != 0:
             raise RuntimeError(
                 f'{self._what} failed in background process:\n'
@@ -239,14 +294,61 @@ class BackgroundDiagnostics(_BackgroundPlots):
                          'Diagnostic plots')
 
 
-class BackgroundSpikePositions(_BackgroundPlots):
-    """`plot_spike_positions` in a separate process."""
+class BackgroundSpikePositions:
+    """`plot_spike_positions` in separate processes.
 
-    def __init__(self, clu, is_refractory, positions, results_dir):
+    For many spikes, drawing the markers takes most of the time (~28 s for
+    2.7M spikes), so the image is drawn as `n_strips` vertical strips in
+    parallel (see `_spike_positions_strip`) and put together in `wait()`.
+    The png is the same as the one `plot_spike_positions` writes.
+    """
+
+    def __init__(self, clu, is_refractory, positions, results_dir,
+                 n_strips=None):
+        import pickle, tempfile
         from pathlib import Path
-        super().__init__('_spike_positions_from_file',
-                         (clu, is_refractory, positions, Path(results_dir)),
-                         'Spike position plot')
+        self._results_dir = Path(results_dir)
+        if n_strips is None:
+            n_strips = 1 if len(clu) < 300_000 else min(6, os.cpu_count() or 1)
+        self._tmpdir = None
+        if n_strips <= 1:
+            self._procs = [_BackgroundPlots(
+                '_spike_positions_from_file',
+                (clu, is_refractory, positions, self._results_dir),
+                'Spike position plot'
+                )]
+            return
+        self._tmpdir = tempfile.mkdtemp(prefix='ks_positions_')
+        args_path = os.path.join(self._tmpdir, 'args.pkl')
+        with open(args_path, 'wb') as f:
+            pickle.dump((clu, is_refractory, positions), f)
+        self._strips = [os.path.join(self._tmpdir, f'strip_{k}.npy')
+                        for k in range(n_strips)]
+        self._procs = [
+            _BackgroundPlots('_spike_positions_strip_from_file', None,
+                             'Spike position plot', args_path=args_path,
+                             call_args=(k, n_strips, self._strips[k]))
+            for k in range(n_strips)
+            ]
+
+    def wait(self):
+        """Wait for the plot; raise if a plotting process failed."""
+        import shutil
+        from matplotlib import image
+        try:
+            for p in self._procs:
+                p.wait()
+            if self._tmpdir is not None and self._strips:
+                strips = [np.load(s) for s in self._strips]
+                self._strips = []
+                # Same call as savefig's png writer, so the file is the same.
+                image.imsave(self._results_dir / 'spike_positions.png',
+                             np.concatenate(strips, axis=1), format='png',
+                             origin='upper', dpi=_POSITIONS_DPI)
+        finally:
+            if self._tmpdir is not None:
+                shutil.rmtree(self._tmpdir, ignore_errors=True)
+                self._tmpdir = None
 
 
 def _drift_plots_from_file(path):
@@ -269,3 +371,10 @@ def _spike_positions_from_file(path):
     with open(path, 'rb') as f:
         clu, is_refractory, positions, results_dir = pickle.load(f)
     plot_spike_positions(clu, is_refractory, results_dir, positions=positions)
+
+
+def _spike_positions_strip_from_file(path, k, n_strips, out):
+    import pickle
+    with open(path, 'rb') as f:
+        clu, is_refractory, positions = pickle.load(f)
+    _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out)
