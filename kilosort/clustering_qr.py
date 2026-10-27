@@ -1,6 +1,7 @@
 import gc
 import logging
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 
 import numpy as np
 import torch
@@ -144,7 +145,9 @@ def _replay_graph(step, n):
     if n <= 0:
         return
     g = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(g):
+    # thread_local: don't fail because of other threads (e.g. the CPU-only
+    # prefetch thread in `run`) while capturing.
+    with torch.cuda.graph(g, capture_error_mode='thread_local'):
         step()
     for _ in range(n):
         g.replay()
@@ -155,7 +158,8 @@ def _replay_graph(step, n):
 
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
             nclust=200, seed=1, niter=200, lam=0, device=torch.device('cuda'),
-            verbose=False):    
+            verbose=False, M=None):
+    # kn and M from neigh_mat can be passed in together (see `run`).
 
     if kn is None:
         # kn: n_spikes by n_neigh with integer indices into the spike subset
@@ -509,7 +513,34 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     nsp = st.shape[0]
     nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
     total_centers = np.unique(nearest_center).size
-    
+
+    # get_data_cpu and the neighbor search (faiss, on the CPU) for the next
+    # center run on a background thread while the GPU clusters the current
+    # one. The thread only touches CPU data (iC is copied to the CPU; its
+    # values are integers, so get_data_cpu returns the same result).
+    centers = [(jj, kk) for jj in range(len(xcent)) for kk in range(len(ycent))
+               if kk + jj*ycent.size in nearest_center]
+    iC_cpu = iC.cpu() if torch.is_tensor(iC) else iC
+
+    def prepare_center(jj, kk):
+        ix = (nearest_center == kk + jj*ycent.size)
+        Xd, igood, ichan = get_data_cpu(
+            ops, xy, iC_cpu, iclust_template, tF, ycent[kk], xcent[jj],
+            dmin=dmin, dminx=dminx, ix=ix,
+            )
+        kn = M = None
+        if Xd is not None and Xd.shape[0] >= 1000:
+            kn, M = neigh_mat(Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub)
+        return ix, Xd, igood, ichan, kn, M
+
+    prefetch = ThreadPoolExecutor(max_workers=1, thread_name_prefix='kilosort-clustering')
+    futures = {}
+    def submit(ci):
+        if ci < len(centers):
+            futures[ci] = prefetch.submit(prepare_center, *centers[ci])
+    submit(0)
+    ci = 0
+
     clu = np.zeros(nsp, 'int32')
     Wall = torch.zeros((0, ops['Nchan'], ops['settings']['n_pcs']))
     Nfilt = None
@@ -530,7 +561,10 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     continue
                 else:
                     t += 1
-                ix = (nearest_center == ii)
+                # Start preparing the next center, then collect this one.
+                submit(ci + 1)
+                ix, Xd, igood, ichan, kn, M = futures.pop(ci).result()
+                ci += 1
                 ntemp = ix.sum()
 
                 v = False
@@ -542,10 +576,6 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     if verbose:
                         v = True
 
-                Xd, igood, ichan = get_data_cpu(
-                    ops, xy, iC, iclust_template, tF, ycent[kk], xcent[jj],
-                    dmin=dmin, dminx=dminx, ix=ix,
-                    )
                 if Xd is None:
                     nearby_chans_empty += 1
                     continue
@@ -566,8 +596,9 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
 
                     # find new clusters
                     iclust, iclust0, M, _ = cluster(
-                        Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub,
-                        lam=1, seed=seed, device=device, verbose=v
+                        Xd, kn=kn, M=M, nskip=nskip, n_neigh=n_neigh,
+                        max_sub=max_sub, lam=1, seed=seed, device=device,
+                        verbose=v
                         )
 
                     if clear_cache:
@@ -614,6 +645,10 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
             logger.debug('iclust not yet assigned')
             pass
         raise
+    finally:
+        for f in futures.values():
+            f.cancel()
+        prefetch.shutdown(wait=True)
 
     if nearby_chans_empty == total_centers:
         raise ValueError(
