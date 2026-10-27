@@ -713,7 +713,6 @@ def _template_groups(PID):
 def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
                  ix=None, merge_dim=True):
     PID_np = PID
-    PID =  torch.from_numpy(PID).long()
 
     #iU = ops['iU'].cpu().numpy()
     #iC = ops['iCC'][:, ops['iU']]    
@@ -742,7 +741,9 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
     if len(igood) == 0:
         return None, None, None
 
-    pid = PID[igood]
+    # Only convert IDs for the selected spikes. Copying the entire PID array
+    # on every call is especially costly when exporting one cluster at a time.
+    pid = torch.from_numpy(PID_np[igood.numpy()]).long()
     data = tF[igood]
     nspikes, nchanraw, nfeatures = data.shape
     ichan, imap = torch.unique(iC[:, ix], return_inverse=True)
