@@ -1,5 +1,6 @@
 import gc
 import logging
+import weakref
 
 import numpy as np
 import torch
@@ -583,8 +584,32 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     return clu, Wall
 
 
+_template_group_cache = {'ref': None, 'val': None}
+
+
+def _template_groups(PID):
+    """Group spike indices by template with one stable argsort.
+
+    Returns (order, bounds) such that order[bounds[t]:bounds[t+1]] are the
+    spikes detected with template t, in ascending order. The result for the
+    most recent PID array is cached, since the same array is passed for
+    every clustering center.
+    """
+    cache = _template_group_cache
+    ref = cache['ref']
+    if ref is not None and ref() is PID and cache['val'][2] == PID.size:
+        return cache['val'][:2]
+    nvals = int(PID.max()) + 1 if PID.size else 0
+    order = np.argsort(PID, kind='stable')
+    bounds = np.searchsorted(PID[order], np.arange(nvals + 1))
+    cache['ref'] = weakref.ref(PID)
+    cache['val'] = (order, bounds, PID.size)
+    return order, bounds
+
+
 def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
                  ix=None, merge_dim=True):
+    PID_np = PID
     PID =  torch.from_numpy(PID).long()
 
     #iU = ops['iU'].cpu().numpy()
@@ -601,7 +626,15 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
             torch.abs(xy[1] - y0) < dmin,
             torch.abs(xy[0] - x0) < dminx
             )
-    igood = ix[PID].nonzero()[:,0]
+    # Same as ix[PID].nonzero()[:,0] (spikes from the selected templates, in
+    # ascending order), without a pass over all spikes for every call.
+    order, bounds = _template_groups(PID_np)
+    tids = ix.nonzero()[:,0].numpy()
+    tids = tids[tids < len(bounds) - 1]
+    if len(tids) == 0:
+        return None, None, None
+    igood = np.sort(np.concatenate([order[bounds[t]:bounds[t+1]] for t in tids]))
+    igood = torch.from_numpy(igood)
 
     if len(igood) == 0:
         return None, None, None
