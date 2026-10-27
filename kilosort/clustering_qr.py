@@ -2,6 +2,7 @@ import gc
 import logging
 import weakref
 from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 import numpy as np
 import torch
@@ -132,6 +133,14 @@ def Mstats(M, device=torch.device('cuda')):
 # from a CUDA graph (the first iterations also warm up the caching allocator).
 _N_EAGER = 2
 
+# Captures in _replay_graph are sequential and their intermediate tensors do
+# not escape. Retain the latest graph per device to keep its private pool
+# alive, then reuse its pool and capture stream for the next graph. A pool
+# handle alone does not keep its allocator pool alive after its last graph is
+# destroyed, and allocator blocks cannot be reused across capture streams.
+_graph_pools = {}
+_graph_pool_lock = Lock()
+
 
 def _replay_graph(step, n):
     """Record one call of `step` as a CUDA graph and replay it `n` times.
@@ -144,25 +153,29 @@ def _replay_graph(step, n):
     """
     if n <= 0:
         return
-    g = torch.cuda.CUDAGraph()
-    # Same as `with torch.cuda.graph(g, capture_error_mode='thread_local')`,
-    # minus the gc.collect() / empty_cache() that older PyTorch versions run
-    # on every capture (~0.1 s each, for hundreds of captures per sort).
-    # thread_local: don't fail because of other threads (e.g. the CPU-only
-    # prefetch thread in `run`) while capturing.
-    torch.cuda.synchronize()
-    capture_stream = torch.cuda.Stream()
-    with torch.cuda.stream(capture_stream):
-        g.capture_begin(capture_error_mode='thread_local')
-        try:
-            step()
-        finally:
-            g.capture_end()
-    for _ in range(n):
-        g.replay()
-    # Make sure the replays have finished before the graph is released.
-    torch.cuda.current_stream().synchronize()
-    del g
+    # Sharing a pool is only safe while graph lifetimes and replays do not
+    # overlap. Serialize the whole capture/replay/release, including callers
+    # from separate threads, and keep externally visible state outside it.
+    with _graph_pool_lock:
+        device = torch.cuda.current_device()
+        previous = _graph_pools.get(device)
+        pool = previous[0].pool() if previous is not None else torch.cuda.graph_pool_handle()
+        capture_stream = previous[1] if previous is not None else torch.cuda.Stream()
+        g = torch.cuda.CUDAGraph()
+        # Avoid torch.cuda.graph's gc.collect()/empty_cache() on older PyTorch.
+        # thread_local allows the CPU-only prefetch thread to keep running.
+        torch.cuda.synchronize()
+        with torch.cuda.stream(capture_stream):
+            g.capture_begin(pool=pool, capture_error_mode='thread_local')
+            try:
+                step()
+            finally:
+                g.capture_end()
+        for _ in range(n):
+            g.replay()
+        # Finish before releasing the previous graph or reusing its pool.
+        torch.cuda.current_stream().synchronize()
+        _graph_pools[device] = (g, capture_stream)
 
 
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
