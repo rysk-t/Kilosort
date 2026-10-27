@@ -11,6 +11,7 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
 from tqdm import tqdm
 
+from kilosort import fused_kernels
 from kilosort.utils import template_path, log_performance
 
 
@@ -131,6 +132,15 @@ def template_centers(ops):
 
 
 def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
+    if device.type == 'cuda' and fused_kernels.enabled():
+        return fused_kernels.verified_call(
+            'template_match', _template_match_torch, fused_kernels.template_match,
+            X, ops, iC, iC2, weigh, device=device
+            )
+    return _template_match_torch(X, ops, iC, iC2, weigh, device=device)
+
+
+def _template_match_torch(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
     nt = ops['nt']
     nt0 = ops['settings']['nt0min']
     nk = ops['settings']['n_templates']
