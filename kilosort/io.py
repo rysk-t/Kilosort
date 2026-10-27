@@ -842,8 +842,11 @@ class BinaryRWFile:
         which matters once the recording no longer fits in the page cache).
         """
         bstart, bend = self._get_batch_edges(ibatch)
-        buf = torch.empty((int(bend - bstart), self.n_chan_bin),
-                          dtype=torch.int16, pin_memory=True)
+        # Like the memmap slice this replaces, stop at the end of the file
+        # (the first batch of a recording shorter than NT + nt).
+        nsamp = int(min(bend, self.total_samples) - bstart)
+        buf = torch.empty((nsamp, self.n_chan_bin), dtype=torch.int16,
+                          pin_memory=True)
         f = self.filename[0] if isinstance(self.filename, list) else self.filename
         view = memoryview(buf.numpy()).cast('B')
         with open(f, 'rb', buffering=0) as fh:
