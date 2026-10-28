@@ -73,8 +73,10 @@ def test_final_extraction_window_and_absolute_times(monkeypatch, stable):
     U = torch.tensor([[[1., 0.]]], dtype=torch.float64)
     rez = {'W': W, 'U': U, 'mu': torch.tensor([2.], dtype=torch.float64),
            'wPCA': torch.ones((1, 3)), 'wTEMP': torch.ones((1, 3))}
+    svd_calls = []
     def backend(name, p, *args):
         if name == 'svd_small2':
+            svd_calls.append(1)
             return W, U, rez['mu']
         assert name == 'mpnu8'
         assert p[16] == stable
@@ -89,6 +91,7 @@ def test_final_extraction_window_and_absolute_times(monkeypatch, stable):
     np.testing.assert_array_equal(st[:, 4], [0, 0, 1, 1])
     assert fw.shape == (4, 2) and fpc.shape == (4, 1, 2)
     assert updated['nsp'].tolist() == [4]
+    assert len(svd_calls) == 1
 
 
 
@@ -231,3 +234,41 @@ def test_cuda_mpnu_matches_torch_reference_on_synthetic_spikes():
     ref_dw = reference['dWU0']
     rel_error = torch.linalg.vector_norm(actual['dWU0'].cpu() - ref_dw) / torch.linalg.vector_norm(ref_dw).clamp_min(1e-12)
     assert rel_error < .1
+
+
+def test_get_spikes_reference_returns_raw_clips_from_all_channels():
+    X = torch.zeros((2, 100))
+    X[0, 40:43] = torch.tensor([0., -10., 0.])
+    X[1, 40:43] = torch.tensor([2., 3., 4.])
+    p = np.array([100, 0, 5, 1, 3, 2, 1, 0, 0, 2, 2, 1, 0, 1, 1, 5, 1], dtype=np.float64)
+    clips, dout = learn._get_spikes_reference(p, X, torch.tensor([[0., -1., 0.]]),
+                                                torch.tensor([[0, 1], [1, 0]], dtype=torch.int32))
+    assert clips.shape == (1, 2, 3)
+    torch.testing.assert_close(clips[0], X[:, 40:43])
+    assert dout.shape == X.shape
+    assert dout[0, 40] == 100
+
+
+def test_learning_skips_candidate_detection_at_capacity(monkeypatch):
+    ops = {'nt0': 3, 'nt0min': 1, 'nt': 2, 'batch_size': 10, 'fs': 10,
+           'xc': [0, 1], 'yc': [0, 0], 'ks25': {'nfilt_factor': .5, 'minFR': 0.},
+           'wTEMP': torch.ones((3, 3)), 'wPCA': torch.eye(3)}
+    calls = []
+    def backend(name, p, *args):
+        if name == 'get_spikes2':
+            calls.append(name)
+            return torch.tensor([[[2., 0, 0], [0., 0, 0]]]), None
+        if name == 'svd_small2':
+            dw, W = args[:2]
+            return W, torch.ones((3, len(dw), 2), dtype=torch.float64), torch.ones(len(dw), dtype=torch.float64)
+        n = int(p[1])
+        return {'nsp0': torch.ones(n, dtype=torch.int32),
+                'dWU0': torch.ones((n, 2, 3), dtype=torch.float64), 'drez': torch.zeros((2, 14))}
+    monkeypatch.setattr(learn, '_backend', backend)
+    learn.learn_templates(ops, FakeFile(), [0, 1])
+    assert calls == ['get_spikes2']
+
+
+def test_device_accepts_torch_device_key():
+    assert learn._device({'torch_device': torch.device('cpu')}) == torch.device('cpu')
+    assert learn._device({'device': 'cpu', 'torch_device': 'cuda'}) == torch.device('cpu')

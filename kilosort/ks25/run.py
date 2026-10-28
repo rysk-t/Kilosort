@@ -115,6 +115,7 @@ def run_kilosort25(settings, probe=None, probe_name=None, filename=None,
             ops, bfile, nPCs=settings25['NrankPC'])
         ops['wTEMP'] = wTEMP
         ops['wPCA'] = wPCA
+        ops['n_pcs'] = int(wPCA.shape[0])  # bench.avg_wav expects this many rows
         ops['runtime_wpca'] = time.time() - tic
         logger.info(f'templates extracted in {ops["runtime_wpca"]:.2f}s; '
                     f'total {time.time()-tic0:.2f}s')

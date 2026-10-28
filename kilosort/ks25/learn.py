@@ -17,7 +17,7 @@ def _opt(ops, name, default=None):
 
 
 def _device(ops):
-    device = ops.get('device', 'cpu')
+    device = ops.get('device', ops.get('torch_device', 'cpu'))
     return torch.device(device)
 
 
@@ -193,7 +193,7 @@ def _get_spikes_reference(p, X, wTEMP, iC):
     filtered = F.conv1d(X[:, None, :], wTEMP[:, None, :]).permute(1, 0, 2)
     cs = filtered[:, iC.long()[:, :nsum], :].cumsum(dim=2)
     scores = cs.square() / torch.arange(1, nsum+1, device=X.device)[None, None, :, None]
-    best, choice = scores.permute(1, 0, 2, 3).reshape(nchan, -1, filtered.shape[-1]).max(dim=1)
+    best = scores.permute(1, 0, 2, 3).reshape(nchan, -1, filtered.shape[-1]).max(dim=1).values
     err, chan = best.max(dim=0)
     lock = nt0-1
     local = F.max_pool1d(err[None, None], 2*lock+1, stride=1, padding=lock)[0, 0]
@@ -207,12 +207,9 @@ def _get_spikes_reference(p, X, wTEMP, iC):
         near = (ch[:, None] - ch[None, :]).abs() < 5
         keep = ~((err[times][None, :] > err[times][:, None]) & near).any(dim=1)
         times, ch = times[keep], ch[keep]
-    clips = X.new_zeros((times.numel(), nchan, nt0))
-    for idx in range(times.numel()):
-        k = int(choice[ch[idx], times[idx]])
-        nch, rank = k % nsum + 1, k // nsum
-        channels = iC[ch[idx], :nch].long()
-        clips[idx, channels] = torch.sqrt(err[times[idx]] / nch) * wTEMP[rank]
+    # mexGetSpikes2 calls extract_snips, which copies all raw channels.
+    offsets = torch.arange(nt0, device=X.device)
+    clips = X[:, times[:, None] + offsets].permute(1, 0, 2).contiguous()
     dout = X.new_zeros(X.shape)
     dout[:, :best.shape[-1]] = best
     return clips, dout
@@ -265,6 +262,7 @@ def _mpnu_reference(p, X, U, W, mu, iC, iW, UtU, iList, wPCA):
         best, which = score.max(dim=0)
         best = best.clamp_min(0)
         best[:nt0] = 0
+        best[max(0, nt-nt0):] = 0
         lock = nt0 - 1
         local = F.max_pool1d(best[None, None], 2*lock+1, stride=1, padding=lock)[0, 0]
         valid = (best > float(p[2])**2) & (best >= local)
@@ -404,15 +402,18 @@ def learn_templates(ops, bfile, iorder, progress_bar=None):
             if step % 5 == 0:
                 W, U, dWU, mu, nsp, ndrop = triage_templates2(ops, iW, C2C, W, U, dWU, mu, nsp, ndrop)
             p[1] = len(dWU)
-            candidates, _ = _backend('get_spikes2', p, result['drez'], wTEMP, iC)
-            if len(candidates):
-                ndrop[2] = .9*ndrop[2] + .1*len(candidates)
-                candidates = candidates[:max(0, max_templates - len(dWU))].double()
-                candidates = (candidates @ basis.T) @ basis
-                dWU = torch.cat((dWU, candidates)).contiguous()
-                W = torch.cat((W, basis[:, None, :].expand(-1, len(candidates), -1)), dim=1).contiguous()
-                nsp = torch.cat((nsp, nsp.new_full((len(candidates),), min_count)))
-                mu = torch.cat((mu, mu.new_full((len(candidates),), 10)))
+            if len(dWU) < max_templates:
+                candidates, _ = _backend('get_spikes2', p, result['drez'], wTEMP, iC)
+                if len(candidates):
+                    ndrop[2] = .9*ndrop[2] + .1*len(candidates)
+                    candidates = candidates[:max_templates - len(dWU)]
+                    if len(candidates):
+                        candidates = candidates.double()
+                        candidates = (candidates @ basis.T) @ basis
+                        dWU = torch.cat((dWU, candidates)).contiguous()
+                        W = torch.cat((W, basis[:, None, :].expand(-1, len(candidates), -1)), dim=1).contiguous()
+                        nsp = torch.cat((nsp, nsp.new_full((len(candidates),), min_count)))
+                        mu = torch.cat((mu, mu.new_full((len(candidates),), 10)))
         if step % 100 == 0:
             logger.info('learning batch %d/%d, %d templates', step+1, len(order), len(dWU))
         _progress(progress_bar, step+1, len(order))
@@ -446,26 +447,25 @@ def track_and_sort(ops, bfile, rez, progress_bar=None):
     counts = torch.zeros(nfilt, dtype=torch.float64, device=device)
     rows, fw, fpc = [], [], []
     batch_size, pad = int(_opt(ops, 'batch_size', 60000)), int(_opt(ops, 'nt', nt0))
+    W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
+    utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
+    W32, U32, mu32 = W.float().contiguous(), U.float().contiguous(), mu.float().contiguous()
     for batch in range(bfile.n_batches):
         if batch:
             X = bfile.padded_batch_to_torch(batch, ops)
         p[0] = X.shape[1]
-        W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
-        utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
-        result = _backend('mpnu8', p, X, U.float().contiguous(), W.float().contiguous(), mu.float().contiguous(), iC, iW, utu, ilist, wPCA)
+        result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA)
         total += result['dWU0']
         counts += result['nsp0'].double()
         keep = (result['st0'] >= pad) & (result['st0'] < pad + batch_size)
-        st = result['st0'][keep].cpu().numpy().astype(np.float64)
-        ids = result['id0'][keep].cpu().numpy()
-        amp = result['x0'][keep].cpu().numpy()
-        vexp = result['vexp'][keep].cpu().numpy()
-        st += int(bfile.imin) + batch*batch_size - pad + int(p[11])
-        rows.append(np.column_stack((st, ids, amp, vexp, np.full(len(st), batch))))
+        spike_data = torch.stack(tuple(result[k][keep].to(torch.float64)
+                                       for k in ('st0', 'id0', 'x0', 'vexp')), dim=1).cpu().numpy()
+        spike_data[:, 0] += int(bfile.imin) + batch*batch_size - pad + int(p[11])
+        rows.append(np.column_stack((spike_data, np.full(len(spike_data), batch))))
         fw.append(result['featW'][keep].cpu().numpy())
         fpc.append(result['featPC'][keep].cpu().numpy())
         if batch % 100 == 0:
-            logger.info('extracting batch %d/%d, %d spikes', batch+1, bfile.n_batches, len(st))
+            logger.info('extracting batch %d/%d, %d spikes', batch+1, bfile.n_batches, len(spike_data))
         _progress(progress_bar, batch+1, bfile.n_batches)
     rez.update(W=W, U=U, mu=mu, dWU=total / counts.clamp_min(1)[:, None, None], nsp=counts,
                iC=iC, iW=iW, iNeigh=ilist, iNeighPC=iC[iW.long()].contiguous())

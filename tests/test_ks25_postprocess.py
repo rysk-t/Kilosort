@@ -1,6 +1,7 @@
 """Independent numerical/behavioral checks for the KS2.5 postprocessing port."""
 import copy
 import math
+import threading
 
 import numpy as np
 import pytest
@@ -203,6 +204,54 @@ def test_split_real_cpu_refit():
     assert torch.isfinite(rez['mu']).all()
 
 
+@pytest.mark.parametrize('flag', [True, False])
+def test_pursuit_against_numpy_equations(flag):
+    rng = np.random.default_rng(83)
+    raw = rng.normal(size=(750, 2, 2))
+    raw[:375, 0, 0] += 4
+    flat = raw.reshape(len(raw), -1)
+    clp = flat - flat.mean(axis=0)
+    w = np.linalg.svd(clp.T, full_matrices=False)[0][:, 0] if flag else flat.mean(axis=0)
+    w /= np.linalg.norm(w)
+    x = clp @ w
+    upper, lower = x[x > x.mean()], x[x < x.mean()]
+    means = np.array([upper.mean(), lower.mean()])
+    variances = np.array([upper.var(ddof=1), lower.var(ddof=1)])
+    p = len(upper) / len(x)
+    for iteration in range(1, 51):
+        logp = -.5 * np.log(variances) - (x[:, None] - means)**2 / (2 * variances) + np.log([p, 1-p])
+        rs = np.exp(logp - logp.max(axis=1, keepdims=True))
+        rs /= rs.sum(axis=1, keepdims=True)
+        p = rs[:, 0].mean()
+        means = (rs * x[:, None]).sum(axis=0) / rs.sum(axis=0)
+        variances = (rs * (x[:, None] - means)**2).sum(axis=0) / rs.sum(axis=0)
+        if iteration > 10 and iteration % 2:
+            covariance = clp.T @ (clp * (rs / variances).sum(axis=1)[:, None]) / len(x)
+            target = clp.T @ (rs @ (means / variances)) / len(x)
+            w = np.linalg.solve(covariance, target)
+            x = clp @ (w / np.linalg.norm(w))
+    actual = pp._bimodal_pursuit(raw, flag, 'cpu')
+    if np.linalg.norm(actual - rs) > np.linalg.norm(actual - rs[:, ::-1]):
+        rs = rs[:, ::-1]
+    np.testing.assert_allclose(actual, rs, atol=2e-12, rtol=2e-12)
+
+
+def test_empty_templates_pass_through_postprocessing(tmp_path):
+    rez, ops = export_fixture(tmp_path, empty=True)
+    for key in ('W', 'U'):
+        rez[key] = rez[key][:, :0]
+    for key in ('mu', 'dWU', 'good', 'est_contam_rate', 'iNeigh', 'iNeighPC'):
+        rez[key] = rez[key][:0]
+    rez['simScore'] = np.empty((0, 0), dtype=np.float32)
+    pp.find_merges(rez, ops)
+    pp.split_all_clusters(rez, ops)
+    pp.set_cutoff(rez, ops)
+    rez['good'] = pp.get_good_units(rez, ops)
+    assert rez['good'].shape == (0,)
+    pp.save_to_phy25(rez, ops, tmp_path / 'empty')
+    assert np.load(tmp_path / 'empty' / 'templates.npy').shape == (0, 14, 2)
+
+
 def test_cutoff_threshold_strictness_good_and_feature_alignment(monkeypatch):
     # At Th=10, Q=.02 tightens tolerance to .04. Three spikes are then too
     # contaminated (.06 < default .1); revert from Th=8.5 to 9.
@@ -229,6 +278,80 @@ def test_cutoff_rejects_first_threshold_and_keeps_empty_units(monkeypatch):
     np.testing.assert_array_equal(rez['Ths'], [10.5, 4., 0.])
     assert not rez['good'].any()
     np.testing.assert_array_equal(rez['est_contam_rate'], 1)
+
+
+def test_cutoff_threaded_matches_serial_with_real_ccgs(monkeypatch):
+    rng = np.random.default_rng(42)
+    spikes = []
+    for cluster in range(10):
+        count = 600 + cluster * 73
+        times = (np.arange(count) * .03 if cluster % 2 else rng.uniform(0, 25, count))
+        spikes.append(np.column_stack((times * 30000, np.full(count, cluster),
+                                       np.ones(count), rng.uniform(3, 14, count), np.zeros(count))))
+    st = np.concatenate(spikes)
+    rng.shuffle(st)
+    features = rng.normal(size=(len(st), 3, 2)).astype(np.float32)
+    rez = dict(st3=st, mu=np.ones(11), cProjPC=features, cProj=features[:, :, 0], st2=st.copy())
+    monkeypatch.setenv('KS_FASTEST_OFF', 'ks25_cutoff_threads')
+    serial = pp.set_cutoff(copy.deepcopy(rez), {})
+    monkeypatch.setenv('KS_FASTEST_OFF', '')
+    parallel = pp.set_cutoff(copy.deepcopy(rez), {})
+    for key in ('st3', 'st2', 'cProj', 'cProjPC', 'good', 'est_contam_rate', 'Ths'):
+        np.testing.assert_array_equal(parallel[key], serial[key])
+
+
+def test_cutoff_clusters_really_execute_concurrently(monkeypatch):
+    monkeypatch.setenv('KS_FASTEST_OFF', '')
+    rendezvous = threading.Barrier(4)
+    state = threading.local()
+    def refractory(a, b):
+        if not getattr(state, 'started', False):
+            state.started = True
+            # A serial executor cannot get four clusters to this barrier.
+            rendezvous.wait(timeout=10)
+        return None, .01, .01
+    monkeypatch.setattr(pp, '_refractory', refractory)
+    st = np.zeros((80, 5))
+    st[:, 0], st[:, 1], st[:, 3] = np.arange(80) * 100, np.repeat(np.arange(4), 20), 12
+    rez = pp.set_cutoff({'st3': st, 'mu': np.ones(4)}, {})
+    np.testing.assert_array_equal(rez['good'], True)
+    np.testing.assert_array_equal(rez['Ths'], 4)
+
+
+def test_split_threading_preserves_parent_revisit_and_refit(monkeypatch):
+    monkeypatch.setattr(pp, '_refractory', lambda a, b: (None, 1., 1.))
+    rez, ops = split_rez()
+    monkeypatch.setenv('KS_FASTEST_OFF', 'ks25_split_ccg_threads')
+    serial = pp.split_all_clusters(copy.deepcopy(rez), ops)
+    monkeypatch.setenv('KS_FASTEST_OFF', '')
+    parallel = pp.split_all_clusters(copy.deepcopy(rez), ops)
+    assert serial['W'].shape[1] == 2
+    for key in ('st3', 'W', 'U', 'mu', 'dWU', 'simScore', 'iNeigh', 'iNeighPC', 'isplit'):
+        np.testing.assert_array_equal(pp._numpy(parallel[key]), pp._numpy(serial[key]))
+
+
+def test_split_ccg_overlaps_waveforms_on_calling_thread(monkeypatch):
+    monkeypatch.setenv('KS_FASTEST_OFF', '')
+    caller = threading.get_ident()
+    ccg_started, waveforms_done = threading.Event(), threading.Event()
+    original = pp._split_waveforms
+    def refractory(a, b):
+        assert threading.get_ident() != caller
+        ccg_started.set()
+        assert waveforms_done.wait(timeout=10)
+        return None, 1., 1.
+    def waveforms(*args):
+        assert threading.get_ident() == caller
+        assert ccg_started.wait(timeout=10)
+        result = original(*args)
+        waveforms_done.set()
+        return result
+    monkeypatch.setattr(pp, '_refractory', refractory)
+    monkeypatch.setattr(pp, '_split_waveforms', waveforms)
+    monkeypatch.setattr(pp, '_refit_templates', lambda *args: None)
+    rez, ops = split_rez()
+    pp.split_all_clusters(rez, ops)
+    assert rez['W'].shape[1] == 2
 
 
 def test_good_units_spatial_radius_and_zero_waveform():
@@ -297,14 +420,32 @@ def test_phy_export_sorted_features_raw_mapping_and_six_pc_ops(tmp_path, empty):
     np.testing.assert_array_equal(rez['st3'], original_st)
 
 
+@pytest.mark.parametrize('matrix', [np.zeros((2, 2)), np.ones((2, 2))])
+def test_phy_export_singular_whitening_uses_finite_pseudoinverse(tmp_path, matrix):
+    rez, ops = export_fixture(tmp_path)
+    rez['Wrot'] = torch.as_tensor(matrix)
+    output = tmp_path / 'singular'
+    pp.save_to_phy25(rez, ops, output)
+    actual = np.load(output / 'whitening_mat_inv.npy')
+    assert np.isfinite(actual).all()
+    np.testing.assert_allclose(actual, np.linalg.pinv(matrix))
+    np.testing.assert_allclose(matrix @ actual @ matrix, matrix)
+    amplitude = float((output / 'cluster_Amplitude.tsv').read_text().splitlines()[1].split('\t')[1])
+    assert np.isfinite(amplitude)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
-def test_split_cuda_refit_and_cpu_em_agreement(gpu):
+def test_split_cuda_refit_and_cpu_em_agreement(gpu, monkeypatch):
     if not gpu:
         pytest.skip('use --gpu under .bench/gpulock.py')
-    rez, ops = split_rez(n=20)
+    # Exercise the worker CCG + calling-thread CUDA waveform reconstruction
+    # on an accepted split, including parent/child revisits and final refit.
+    monkeypatch.setattr(pp, '_refractory', lambda a, b: (None, 1., 1.))
+    rez, ops = split_rez()
     for key in ('W', 'U', 'mu', 'dWU', 'wPCA'):
         rez[key] = rez[key].cuda()
     pp.split_all_clusters(rez, ops)
+    assert rez['W'].shape[1] == 2
     assert rez['W'].is_cuda and rez['U'].is_cuda
     assert torch.isfinite(rez['W']).all() and torch.isfinite(rez['mu']).all()
     features = split_rez()[0]['cProjPC']

@@ -6,11 +6,15 @@ CCG implementation (which has different histogram endpoints and shoulders).
 """
 import logging
 import math
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import torch
 from numba import njit
+
+from kilosort.utils import fastest
 
 logger = logging.getLogger(__name__)
 
@@ -253,7 +257,28 @@ def split_all_clusters(rez, ops, flag=True):
 
     ``flag`` selects initialization (top PC vs. mean), not whether to split.
     Set ``ks25.fix_split_swap=False`` for MATLAB's swapped child waveform.
+    CCG runs on a CPU worker alongside waveform reconstruction; all parent
+    revisits and template mutations stay ordered on the calling thread.
     """
+    pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix='ks25-split-ccg')
+            if fastest('ks25_split_ccg_threads') else nullcontext())
+    with pool as executor:
+        return _split_all_clusters(rez, ops, flag, executor)
+
+
+def _split_waveforms(features, low, pc, device):
+    f = torch.as_tensor(features, device=device, dtype=torch.float64)
+    mask = torch.as_tensor(low, device=device)
+    c1, c2 = f[mask].mean(0).T @ pc, f[~mask].mean(0).T @ pc
+    a, b = c1.flatten(), c2.flatten()
+    ac, bc = a - a.mean(), b - b.mean()
+    correlation = (ac @ bc) / (torch.linalg.vector_norm(ac) * torch.linalg.vector_norm(bc))
+    n1, n2 = torch.linalg.vector_norm(a), torch.linalg.vector_norm(b)
+    amplitude_difference = 2 * (n1 - n2).abs() / (n1 + n2)
+    return c1, c2, correlation, amplitude_difference
+
+
+def _split_all_clusters(rez, ops, flag, ccg_executor):
     from . import learn
 
     original = rez['dWU']
@@ -301,19 +326,20 @@ def split_all_clusters(rez, ops, flag=True):
             cluster += 1
             continue
         ss = st[indices, 0] / fs
-        _, Q, R = _refractory(ss[low], ss[~low])
+        if ccg_executor is not None:
+            ccg_future = ccg_executor.submit(_refractory, ss[low], ss[~low])
+            # Torch/GPU work remains on the caller's stream. Only NumPy and
+            # nogil numba CCG code runs in the worker, with immutable inputs.
+            c1, c2, correlation, amplitude_difference = _split_waveforms(features, low, pc, device)
+            _, Q, R = ccg_future.result()
+        else:
+            _, Q, R = _refractory(ss[low], ss[~low])
         if Q < .25 and R < .05:
             vetoes += 1
             cluster += 1
             continue
-        f = torch.as_tensor(features, device=device, dtype=torch.float64)
-        mask = torch.as_tensor(low, device=device)
-        c1, c2 = f[mask].mean(0).T @ pc, f[~mask].mean(0).T @ pc
-        a, b = c1.flatten(), c2.flatten()
-        ac, bc = a - a.mean(), b - b.mean()
-        correlation = (ac @ bc) / (torch.linalg.vector_norm(ac) * torch.linalg.vector_norm(bc))
-        n1, n2 = torch.linalg.vector_norm(a), torch.linalg.vector_norm(b)
-        amplitude_difference = 2 * (n1 - n2).abs() / (n1 + n2)
+        if ccg_executor is None:
+            c1, c2, correlation, amplitude_difference = _split_waveforms(features, low, pc, device)
         if bool((correlation > .9) & (amplitude_difference < .2)):
             cluster += 1
             continue
@@ -348,7 +374,11 @@ def split_all_clusters(rez, ops, flag=True):
 
 
 def set_cutoff(rez, ops):
-    """Lower vexp thresholds by .5 while the ACG remains refractory."""
+    """Lower vexp thresholds by .5 while the ACG remains refractory.
+
+    Independent clusters run on up to six CPU workers. Results and spike
+    masks are applied in cluster-index order, never by completion order.
+    """
     st = _numpy(rez['st3'])
     count = len(rez['mu'])
     good, contamination = np.zeros(count, dtype=bool), np.ones(count)
@@ -358,11 +388,14 @@ def set_cutoff(rez, ops):
     if not np.isfinite([high, low]).all() or high < low:
         raise ValueError('Th must contain finite descending learning/extraction thresholds')
     fs = float(_opt(ops, 'fs', 30000))
-    for cluster, indices in enumerate(_groups(st[:, 1], count)):
+    groups = _groups(st[:, 1], count)
+
+    def one_cluster(indices):
         if not len(indices):
-            continue
+            return False, 1., 0., indices
         ss, vexp = st[indices, 0] / fs, st[indices, 3]
         threshold, allowed = high, .1
+        is_good, contam = False, 1.
         while threshold >= low:
             selected = ss[vexp > threshold]
             if not len(selected):
@@ -373,14 +406,21 @@ def set_cutoff(rez, ops):
                 break
             if threshold == high and Q < .05:
                 allowed = min(.05, max(.01, Q * 2))
-            good[cluster] = True
+            is_good = True
             threshold -= .5
         threshold += .5
         selected = ss[vexp > threshold]
         if len(selected):
-            _, contamination[cluster], _ = _refractory(selected, selected)
-        thresholds[cluster] = threshold
-        keep[indices[vexp <= threshold]] = False
+            _, contam, _ = _refractory(selected, selected)
+        return is_good, contam, threshold, indices[vexp <= threshold]
+
+    pool = (ThreadPoolExecutor(max_workers=min(6, count), thread_name_prefix='ks25-cutoff')
+            if count > 1 and fastest('ks25_cutoff_threads') else nullcontext())
+    with pool as executor:
+        results = executor.map(one_cluster, groups) if executor else map(one_cluster, groups)
+        for cluster, (is_good, contam, threshold, removed) in enumerate(results):
+            good[cluster], contamination[cluster], thresholds[cluster] = is_good, contam, threshold
+            keep[removed] = False
     contamination[np.isnan(contamination)] = 1
     rez.update(good=good, est_contam_rate=contamination, Ths=thresholds)
     # Zero is a valid template ID. A mask replaces MATLAB's 0 sentinel.
@@ -445,7 +485,13 @@ def save_to_phy25(rez, ops, results_dir):
     templates = np.einsum('rfc,rft->ftc', U.astype(np.float32), W.astype(np.float32))
     nfilt, _, nchan = templates.shape
     whitening = _numpy(rez.get('Wrot', ops.get('Wrot')))
-    inv_whitening = np.linalg.inv(whitening)
+    try:
+        inv_whitening = np.linalg.inv(whitening)
+    except np.linalg.LinAlgError:
+        # Preserve the ordinary inverse for full-rank recordings, while
+        # allowing dead/redundant channels to be exported to Phy as well.
+        logger.warning('Singular whitening matrix; exporting its pseudoinverse.')
+        inv_whitening = np.linalg.pinv(whitening)
     positions = np.column_stack([_numpy(rez.get(k, ops.get(k, ops.get('probe', {}).get(k)))).reshape(-1)
                                  for k in ('xc', 'yc')])
     arrays = {
