@@ -50,8 +50,14 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "slow: mark test as slow to run")
+    config.addinivalue_line("markers", "gpu: mark test as needing the --gpu option")
 
 def pytest_collection_modifyitems(config, items):
+    if not config.getoption("--gpu"):
+        skip_gpu = pytest.mark.skip(reason="need --gpu option to run")
+        for item in items:
+            if "gpu" in item.keywords:
+                item.add_marker(skip_gpu)
     if config.getoption("--runslow"):
         # --runslow given in cli: do not skip slow tests
         return

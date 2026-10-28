@@ -163,17 +163,24 @@ def get_me_wtw2(W, U, Nnearest=None):
 def triage_templates2(ops, iW, C2C, W, U, dWU, mu, nsp, ndrop):
     del iW, C2C
     threshold = float(_opt(ops, 'minFR', 1/50)) * int(_opt(ops, 'batch_size', 60000)) / float(_opt(ops, 'fs', 30000))
-    keep = nsp >= threshold
-    ndrop[0] = .9 * ndrop[0] + .1 * int((~keep).sum())
-    W, U, dWU, mu, nsp = W[:, keep], U[:, keep], dWU[keep], mu[keep], nsp[keep]
+    def select(indices):
+        return (W.index_select(1, indices), U.index_select(1, indices),
+                dWU.index_select(0, indices), mu.index_select(0, indices),
+                nsp.index_select(0, indices))
+
+    # A single nonzero per filtering stage determines the dynamic output size;
+    # reuse its indices for all five arrays and for the drop statistics.
+    indices = torch.nonzero(nsp >= threshold, as_tuple=True)[0]
+    ndrop[0] = .9 * ndrop[0] + .1 * (nsp.numel() - indices.numel())
+    W, U, dWU, mu, nsp = select(indices)
     if nsp.numel():
         cc, _ = get_me_wtw2(W, U)
         cc.fill_diagonal_(0)
         delta = (mu[:, None] - mu[None, :]).abs()
         drop = ((cc > .9) & (4 * math.sqrt(10) > delta) & (nsp[:, None] < nsp[None, :])).any(dim=1)
-        ndrop[1] = .9 * ndrop[1] + .1 * int(drop.sum())
-        keep = ~drop
-        W, U, dWU, mu, nsp = W[:, keep], U[:, keep], dWU[keep], mu[keep], nsp[keep]
+        indices = torch.nonzero(~drop, as_tuple=True)[0]
+        ndrop[1] = .9 * ndrop[1] + .1 * (nsp.numel() - indices.numel())
+        W, U, dWU, mu, nsp = select(indices)
     else:
         ndrop[1] *= .9
     return W.contiguous(), U.contiguous(), dWU.contiguous(), mu.contiguous(), nsp.contiguous(), ndrop

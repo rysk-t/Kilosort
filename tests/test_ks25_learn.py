@@ -316,3 +316,21 @@ def test_gpu_fused_template_update_is_bit_identical(monkeypatch):
     monkeypatch.delenv('KS_FASTEST_OFF')
     actual, _ = learn._update_running_templates(old.clone(), batch_sum, counts, .997)
     assert torch.equal(actual, expected)
+
+
+def test_triage_preserves_equal_rate_duplicates_and_empty_case():
+    W = torch.tensor([[[1., 0.], [1., 0.], [1., 0.]]])
+    U = torch.tensor([[[1., 0.], [1., 0.], [1., 0.]]])
+    dw = torch.arange(12, dtype=torch.float64).reshape(3, 2, 2)
+    mu = torch.tensor([5., 5., 5.])
+    ops = {'minFR': 1., 'batch_size': 1, 'fs': 1}
+    result = learn.triage_templates2(ops, None, None, W, U, dw, mu,
+                                      torch.tensor([4., 4., 2.]), np.zeros(3))
+    torch.testing.assert_close(result[2], dw[:2])
+    assert result[4].tolist() == [4., 4.]
+    np.testing.assert_allclose(result[5], [0., .1, 0.])
+    result = learn.triage_templates2(ops, None, None, W, U, dw, mu,
+                                      torch.zeros(3), np.array([1., 2., 3.]))
+    assert result[0].shape == (1, 0, 2)
+    assert result[2].shape == (0, 2, 2)
+    np.testing.assert_allclose(result[5], [1.2, 1.8, 3.])

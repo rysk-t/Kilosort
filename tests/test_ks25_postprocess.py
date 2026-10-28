@@ -493,6 +493,25 @@ def test_phy_export_singular_whitening_uses_finite_pseudoinverse(tmp_path, matri
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
+@pytest.mark.parametrize('flag', [True, False])
+def test_cuda_batched_pursuit_matches_scalar_without_label_flip(gpu, flag):
+    if not gpu:
+        pytest.skip('use --gpu under .bench/gpulock.py')
+    rng = np.random.default_rng(37)
+    features = []
+    for n in (503, 697, 513):
+        f = rng.normal(size=(n, 3, 32))
+        f[:n // 2, 0, 0] += 3
+        features.append(f)
+    features[-1][:, 2, -1] = 0
+    scalar = [pp._bimodal_pursuit(f, flag, 'cuda') for f in features]
+    batched = pp._bimodal_pursuit_batch(features, flag, 'cuda')
+    for a, b in zip(batched, scalar):
+        np.testing.assert_allclose(a, b, atol=1e-8, rtol=1e-8)
+        np.testing.assert_array_equal(a[:, 0] > a[:, 1], b[:, 0] > b[:, 1])
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA required')
 def test_split_cuda_refit_and_cpu_em_agreement(gpu, monkeypatch):
     if not gpu:
         pytest.skip('use --gpu under .bench/gpulock.py')

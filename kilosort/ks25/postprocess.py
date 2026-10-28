@@ -8,6 +8,7 @@ import logging
 import math
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
+from functools import lru_cache
 from pathlib import Path
 
 import numpy as np
@@ -266,6 +267,23 @@ def _bimodal_pursuit_batch(features, flag, device):
     means = (x[:, :, None] * sides).sum(1) / sizes
     variances = ((x[:, :, None] - means[:, None, :]).square() * sides).sum(1) / (sizes - 1)
     p = sizes[:, 0] / n
+    iterations = (_pursuit_cuda_iterations if clp.is_cuda and fastest('ks25_split_em_fused')
+                  else _pursuit_torch_iterations)
+    rs, alive, fallback = iterations(clp, x, means, variances, p, n, alive)
+    status = _numpy(torch.stack((alive, fallback), dim=1))
+    responsibilities = _numpy(rs)
+    for j in range(count):
+        if status[j, 1]:
+            result[j] = _bimodal_pursuit(features[j], flag, device)
+        elif status[j, 0]:
+            result[j] = responsibilities[j, :lengths[j]].copy()
+    return result
+
+
+def _pursuit_torch_iterations(clp, x, means, variances, p, n, alive):
+    count, maximum, dim = clp.shape
+    device = clp.device
+    mask = torch.arange(maximum, device=device)[None, :] < n[:, None]
     fallback = torch.zeros_like(alive)
     transpose = clp.transpose(1, 2)
     identity = torch.eye(dim, dtype=clp.dtype, device=device)[None]
@@ -300,14 +318,130 @@ def _bimodal_pursuit_batch(features, flag, device):
             alive &= ~failed & torch.isfinite(norm) & (norm > 0)
             w = torch.where(alive[:, None], w / norm[:, None], 0.)
             x = torch.bmm(clp, w[:, :, None]).squeeze(2)
-    status = _numpy(torch.stack((alive, fallback), dim=1))
-    responsibilities = _numpy(rs)
-    for j in range(count):
-        if status[j, 1]:
-            result[j] = _bimodal_pursuit(features[j], flag, device)
-        elif status[j, 0]:
-            result[j] = responsibilities[j, :lengths[j]].copy()
-    return result
+    return rs, alive, fallback
+
+
+_PURSUIT_CUDA = r'''
+__device__ double sum_block(double value, double* buffer) {
+    int t = threadIdx.x;
+    buffer[t] = value;
+    __syncthreads();
+    for (int stride=128; stride; stride/=2) {
+        if (t < stride) buffer[t] += buffer[t+stride];
+        __syncthreads();
+    }
+    double result = buffer[0];
+    __syncthreads();
+    return result;
+}
+extern "C" __global__ void pursuit_em(
+        const double* x, const long long* lengths, double* model, bool* alive,
+        double* rs, double* weights, double* target, int maximum, int update) {
+    int b=blockIdx.x, t=threadIdx.x, n=lengths[b];
+    const double *xb=x+(long long)b*maximum;
+    double *rb=rs+(long long)b*maximum*2;
+    double *wb=weights+(long long)b*maximum, *tb=target+(long long)b*maximum;
+    double *m=model+b*5;
+    double mu1=m[0], mu2=m[1], s1=m[2], s2=m[3], p=m[4];
+    __shared__ double scratch[256];
+    bool valid=alive[b] && isfinite(s1) && isfinite(s2) && s1>0 && s2>0 && p>0 && p<1;
+    if (!valid) {
+        if (!t) alive[b]=false;
+        for (int i=t; i<n; i+=256) rb[2*i]=rb[2*i+1]=wb[i]=tb[i]=0;
+        return;
+    }
+    double log1=-.5*log(s1)+log(p), log2=-.5*log(s2)+log(1-p);
+    double r1sum=0, r2sum=0, x1sum=0, x2sum=0;
+    for (int i=t; i<n; i+=256) {
+        double v=xb[i];
+        double a=log1-(v-mu1)*(v-mu1)/(2*s1), c=log2-(v-mu2)*(v-mu2)/(2*s2);
+        double top=fmax(a,c), e1=exp(a-top), e2=exp(c-top);
+        double r1=e1/(e1+e2), r2=e2/(e1+e2);
+        rb[2*i]=r1; rb[2*i+1]=r2;
+        r1sum+=r1; r2sum+=r2; x1sum+=r1*v; x2sum+=r2*v;
+    }
+    r1sum=sum_block(r1sum,scratch); r2sum=sum_block(r2sum,scratch);
+    x1sum=sum_block(x1sum,scratch); x2sum=sum_block(x2sum,scratch);
+    mu1=x1sum/r1sum; mu2=x2sum/r2sum;
+    double v1=0, v2=0;
+    for (int i=t; i<n; i+=256) {
+        double a=xb[i]-mu1, c=xb[i]-mu2;
+        v1+=rb[2*i]*a*a; v2+=rb[2*i+1]*c*c;
+    }
+    s1=sum_block(v1,scratch)/r1sum; s2=sum_block(v2,scratch)/r2sum;
+    if (!t) {m[0]=mu1; m[1]=mu2; m[2]=s1; m[3]=s2; m[4]=r1sum/n;}
+    if (update) {
+        bool ok=s1>0 && s2>0;
+        if (!ok && !t) alive[b]=false;
+        for (int i=t; i<n; i+=256) {
+            wb[i]=ok ? rb[2*i]/s1+rb[2*i+1]/s2 : 0;
+            tb[i]=ok ? rb[2*i]*mu1/s1+rb[2*i+1]*mu2/s2 : 0;
+        }
+    }
+}
+extern "C" __global__ void pursuit_prepare(
+        double* matrix, double* rhs, const long long* lengths, const bool* alive, int dim) {
+    int b=blockIdx.x;
+    for (int i=threadIdx.x; i<dim*dim; i+=256)
+        matrix[(long long)b*dim*dim+i]=alive[b] ? matrix[(long long)b*dim*dim+i]/lengths[b] : (i/dim==i%dim);
+    for (int i=threadIdx.x; i<dim; i+=256)
+        rhs[b*dim+i]=alive[b] ? rhs[b*dim+i]/lengths[b] : 0;
+}
+extern "C" __global__ void pursuit_normalize(
+        double* direction, const int* info, bool* alive, bool* fallback, int dim) {
+    int b=blockIdx.x, t=threadIdx.x;
+    __shared__ double scratch[256];
+    __shared__ bool ok;
+    double norm2=0;
+    for (int i=t; i<dim; i+=256) norm2+=direction[b*dim+i]*direction[b*dim+i];
+    double norm=sqrt(sum_block(norm2,scratch));
+    if (!t) {
+        bool failed=info[b]!=0 || !isfinite(norm);
+        fallback[b]=fallback[b] || (alive[b] && failed);
+        ok=alive[b] && !failed && norm>0;
+        alive[b]=ok;
+    }
+    __syncthreads();
+    for (int i=t; i<dim; i+=256) direction[b*dim+i]=ok ? direction[b*dim+i]/norm : 0;
+}
+'''
+
+
+@lru_cache(maxsize=None)
+def _pursuit_cuda_module(device_index):
+    import cupy as cp
+    with cp.cuda.Device(device_index):
+        module = cp.RawModule(code=_PURSUIT_CUDA, options=('--fmad=false',))
+        return tuple(module.get_function(name) for name in
+                     ('pursuit_em', 'pursuit_prepare', 'pursuit_normalize'))
+
+
+def _pursuit_cuda_iterations(clp, x, means, variances, p, n, alive):
+    from kilosort.fused_kernels import _device, _stream, _p
+
+    count, maximum, dim = clp.shape
+    model = torch.cat((means, variances, p[:, None]), dim=1).contiguous()
+    lengths = n.long()
+    rs = clp.new_zeros((count, maximum, 2))
+    weights, target = clp.new_zeros((count, maximum)), clp.new_zeros((count, maximum))
+    fallback = torch.zeros_like(alive)
+    transpose = clp.transpose(1, 2)
+    with _device(clp), _stream():
+        em, prepare, normalize = _pursuit_cuda_module(clp.device.index)
+        for iteration in range(1, 51):
+            update = iteration > 10 and iteration % 2
+            em((count,), (256,), (_p(x), _p(lengths), _p(model), _p(alive), _p(rs),
+                                  _p(weights), _p(target), np.int32(maximum), np.int32(update)))
+            if update:
+                matrix = torch.bmm(transpose, clp * weights[:, :, None])
+                rhs = torch.bmm(transpose, target[:, :, None])
+                prepare((count,), (256,), (_p(matrix), _p(rhs), _p(lengths), _p(alive), np.int32(dim)))
+                lower, info = torch.linalg.cholesky_ex(matrix, check_errors=False)
+                y = torch.linalg.solve_triangular(lower, rhs, upper=False)
+                w = torch.linalg.solve_triangular(lower.transpose(1, 2), y, upper=True)
+                normalize((count,), (256,), (_p(w), _p(info), _p(alive), _p(fallback), np.int32(dim)))
+                x = torch.bmm(clp, w).squeeze(2)
+    return rs, alive, fallback
 
 
 def _refit_templates(rez, ops, iC, iW):
