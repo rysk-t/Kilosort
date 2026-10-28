@@ -139,63 +139,99 @@ _SOURCES = {}
 _SOURCES['getspikes'] = r"""
 typedef unsigned long long ptr_t;
 
-// Conv1D: filter channel bid with the NRANK temporal templates
-// (out[r, c, t] = sum_i W[r, i] * data[c, t + i] for t < Tend; the rest is
-// left as it was, zero).
-extern "C" __global__
-void gs_conv1d(ptr_t pdata, ptr_t pW, ptr_t pout, int NT, int Nchan, int Tend)
+// Conv1D: out[r, c, t] = sum_i W[r, i] * data[c, t + i] for t < Tend (the
+// rest is left as it was, zero). Grid (tiles, Nchan), TPC threads per tile
+// of TPC * TRC outputs; each thread computes TRC consecutive outputs of the
+// NRANK filters with a sliding register window of the filters (one shared
+// load of the data and one per filter per step), the terms of each output
+// in the original order.
+#define TRC 4
+#define TPC 256
+#define TILEC (TPC * TRC)
+extern "C" __global__ void __launch_bounds__(TPC)
+gs_conv1d(ptr_t pdata, ptr_t pW, ptr_t pout, int NT, int Nchan, int Tend)
 {
     const float* data = (const float*)pdata;
     const float* W = (const float*)pW;
     float* out = (float*)pout;
     __shared__ float sW[NT0 * NRANK];
-    __shared__ float sdata[TPB + NT0];
-    const int tid = threadIdx.x, bid = blockIdx.x;
-    for (int i = tid; i < NT0 * NRANK; i += TPB) sW[i] = W[i];
+    __shared__ float sdata[TILEC + NT0];
+    const int tid = threadIdx.x, bid = blockIdx.y, t0 = blockIdx.x * TILEC;
+    if (t0 >= Tend) return;
+    for (int i = tid; i < NT0 * NRANK; i += TPC) sW[i] = W[i];
+    for (int i = tid; i < TILEC + NT0; i += TPC) {
+        int s = t0 + i;
+        sdata[i] = (s < NT) ? data[s + (long long)NT * bid] : 0.0f;
+    }
     __syncthreads();
-    for (int tid0 = 0; tid0 < Tend; tid0 += TPB) {
-        for (int i = tid; i < TPB + NT0; i += TPB) {
-            int s = tid0 + i;
-            sdata[i] = (s < NT) ? data[s + (long long)NT * bid] : 0.0f;
+    const int base = tid * TRC;
+    const float* d = sdata + base;
+    float y[NRANK][TRC];
+    #pragma unroll
+    for (int r = 0; r < NRANK; ++r)
+        #pragma unroll
+        for (int j = 0; j < TRC; ++j) y[r][j] = 0.0f;
+    float wv[NRANK][TRC];
+    #pragma unroll
+    for (int r = 0; r < NRANK; ++r)
+        #pragma unroll
+        for (int j = 0; j < TRC; ++j) wv[r][j] = 0.0f;
+    #pragma unroll
+    for (int t = 0; t < NT0 + TRC - 1; ++t) {
+        float dv = d[t];
+        #pragma unroll
+        for (int r = 0; r < NRANK; ++r) {
+            #pragma unroll
+            for (int j = TRC - 1; j > 0; --j) wv[r][j] = wv[r][j - 1];
+            wv[r][0] = (t < NT0) ? sW[t + r * NT0] : 0.0f;
+            #pragma unroll
+            for (int j = 0; j < TRC; ++j)
+                if (t - j >= 0 && t - j < NT0) y[r][j] += wv[r][j] * dv;
         }
-        __syncthreads();
-        int t = tid0 + tid;
-        if (t < Tend) {
-            for (int nid = 0; nid < NRANK; ++nid) {
-                float y = 0.0f;
-                #pragma unroll 4
-                for (int i = 0; i < NT0; ++i) y += sW[i + nid * NT0] * sdata[i + tid];
-                out[t + (long long)NT * bid + (long long)nid * NT * Nchan] = y;
-            }
-        }
-        __syncthreads();
+    }
+    #pragma unroll
+    for (int j = 0; j < TRC; ++j) {
+        int t = t0 + base + j;
+        if (t < Tend)
+            #pragma unroll
+            for (int r = 0; r < NRANK; ++r)
+                out[t + (long long)NT * bid + (long long)r * NT * Nchan] = y[r][j];
     }
 }
 
 // sumChannels: cumulative sum over the Nsum nearest channels of each
 // channel, squared and normalized, max over the number of channels and
-// the templates.
-extern "C" __global__
-void gs_sum_channels(ptr_t pdata, ptr_t pdatasum, ptr_t piC,
-                     int NT, int Nchan, int NchanNear, int Nsum)
+// the templates. Blocks of GCH neighboring channels x TPS time points, so
+// the rows they share stay in L1.
+#define GCH 8
+#define TPS 128
+extern "C" __global__ void __launch_bounds__(TPS)
+gs_sum_channels(ptr_t pdata, ptr_t pdatasum, ptr_t piC,
+                int NT, int Nchan, int NchanNear, int Nsum)
 {
     const float* data = (const float*)pdata;
     float* datasum = (float*)pdatasum;
     const int* iC = (const int*)piC;
-    for (int t = threadIdx.x + blockIdx.x * blockDim.x; t < NT; t += blockDim.x * gridDim.x) {
-        for (int i = 0; i < Nchan; ++i) {
-            float Cmax = 0.0f;
-            for (int r = 0; r < NRANK; ++r) {
-                float Cf = 0.0f;
-                for (int j = 0; j < Nsum; ++j) {
-                    int iChan = iC[j + NchanNear * i];
-                    Cf += data[t + (long long)NT * iChan + (long long)r * NT * Nchan];
-                    float c = Cf * Cf / (1 + j);
-                    if (c > Cmax) Cmax = c;
-                }
+    __shared__ int rows[GCH * 8];
+    const int t = blockIdx.x * TPS + threadIdx.x, i0 = blockIdx.y * GCH;
+    if (threadIdx.x < GCH * Nsum) {
+        int ci = threadIdx.x / Nsum, j = threadIdx.x - ci * Nsum;
+        rows[threadIdx.x] = (i0 + ci < Nchan) ? iC[j + NchanNear * (i0 + ci)] : 0;
+    }
+    __syncthreads();
+    if (t >= NT) return;
+    for (int ci = 0; ci < GCH && i0 + ci < Nchan; ++ci) {
+        float Cmax = 0.0f;
+        for (int r = 0; r < NRANK; ++r) {
+            float Cf = 0.0f;
+            for (int j = 0; j < Nsum; ++j) {
+                int iChan = rows[ci * Nsum + j];
+                Cf += data[t + (long long)NT * iChan + (long long)r * NT * Nchan];
+                float c = Cf * Cf / (1 + j);
+                if (c > Cmax) Cmax = c;
             }
-            datasum[t + (long long)NT * i] = Cmax;
         }
+        datasum[t + (long long)NT * (i0 + ci)] = Cmax;
     }
 }
 
@@ -276,8 +312,8 @@ def get_spikes2(Params, X, wTEMP, iC, maxFR=5000, matlab_tail=False):
     dev = X.device
     wTEMP = _tensor(wTEMP, torch.float32, (Nrank, nt0), 'wTEMP', dev)
     iC = _tensor(iC, torch.int32, (Nchan, NchanNear), 'iC', dev)
-    if Nsum > NchanNear:
-        raise ValueError('Nsum (Params[13]) must not exceed NchanNear (Params[10])')
+    if Nsum > NchanNear or Nsum > 8:
+        raise ValueError('Nsum (Params[13]) must not exceed NchanNear (Params[10]) or 8')
     if nt0 * Nrank > TPB:
         raise ValueError('nt0 * NrankPC must not exceed 1024')
     dout = torch.zeros((Nchan, NT), device=dev)
@@ -292,10 +328,12 @@ def get_spikes2(Params, X, wTEMP, iC, maxFR=5000, matlab_tail=False):
         mask = torch.zeros(NT, dtype=torch.bool, device=dev)
         Tend = _tail(NT, nt0, matlab_tail)
         nblk = (NT + TPB - 1) // TPB
-        _function('getspikes', 'gs_conv1d', defs)(
-            (Nchan,), (TPB,), (_p(X), _p(wTEMP), _p(dfilt), *_i32(NT, Nchan, Tend)))
+        if Tend > 0:
+            _function('getspikes', 'gs_conv1d', defs)(
+                ((Tend + 1023) // 1024, Nchan), (256,), (_p(X), _p(wTEMP), _p(dfilt), *_i32(NT, Nchan, Tend)))
         _function('getspikes', 'gs_sum_channels', defs)(
-            (nblk,), (TPB,), (_p(dfilt), _p(dout), _p(iC), *_i32(NT, Nchan, NchanNear, Nsum)))
+            ((NT + 127) // 128, (Nchan + 7) // 8), (128,),
+            (_p(dfilt), _p(dout), _p(iC), *_i32(NT, Nchan, NchanNear, Nsum)))
         _function('getspikes', 'gs_best_filter', defs)(
             (nblk,), (TPB,), (_p(dout), _p(err), _p(ftype), *_i32(NT, Nchan)))
         lockout = nt0 - 1
@@ -965,19 +1003,24 @@ void mp_best_filter(ptr_t pdout, ptr_t pmu, ptr_t perr, ptr_t peloss, ptr_t pfty
 // not updated, as in the original). The original allows t < NT; its loop
 // bounds never reach the tail, and err is only defined for t < NT - NT0.
 //
-// Block per spike (TPBF threads). Only the templates that overlap the
-// spikes whose windows reach this window ("changed", a superset of the
-// templates whose dout changed at a point) can have a new value at a point
-// t; all the others still have the value of the last scan, whose winner is
-// ftype[t]. If ftype[t] is not changed, the scan over the changed templates
-// plus ftype[t], in index order, gives the same (err, ftype) as the scan
-// over all templates: an unchanged template other than ftype[t] lost to it
-// before and cannot win now (its value is unchanged and ftype[t]'s is too).
-// With the 1e-6 tolerance this holds exactly for values above 8 (the float
-// resolution there exceeds 1e-6), which covers everything above Th^2 >= 16,
-// the only values that the detection reads. If ftype[t] is changed, the
-// full scan is done.
-#define TPBF 128
+// Block per spike. Only the templates that overlap the spikes whose windows
+// reach this window ("changed", a superset of the templates whose dout
+// changed at a point) can have a new value at a point t; all the others
+// still have the value of the last scan, whose winner is ftype[t]. If
+// ftype[t] is not changed, the scan over the changed templates plus
+// ftype[t] gives the same (err, ftype) as the scan over all templates: an
+// unchanged template other than ftype[t] lost to it before and cannot win
+// now (its value is unchanged and ftype[t]'s is too). If ftype[t] is
+// changed, all templates are scanned. GF threads share a time point: each
+// scans an interleaved subset (coalesced over time) and the partial winners
+// are combined (larger value, then smaller index), which is the result of
+// the sequential scan whenever the values that compete differ by more than
+// the 1e-6 tolerance (always the case above 32, where the float resolution
+// exceeds it; a tie within one ulp in [16, 32) could pick the other
+// template; below Th^2 the values are never read).
+#define TPBF 1024
+#define GF 8
+#define TQ (TPBF / GF)
 #define MAXOVL 32
 extern "C" __global__ void __launch_bounds__(TPBF)
 mp_best_filter_update(ptr_t pdout, ptr_t pmu, ptr_t perr, ptr_t pftype, ptr_t pst, ptr_t pid, ptr_t pcounter,
@@ -992,16 +1035,23 @@ mp_best_filter_update(ptr_t pdout, ptr_t pmu, ptr_t perr, ptr_t pftype, ptr_t ps
     const int* counter = (const int*)pcounter;
     const bool* UtU = (const bool*)pUtU;
     extern __shared__ int ssh[];
-    int* list = ssh;                 // sorted changed templates
-    int* ovl_f = list + Nfilt;       // templates of the overlapping spikes
+    int* list = ssh;                             // sorted changed templates
+    float* lm = (float*)(list + Nfilt);          // lam * mu
+    float* lmm = lm + Nfilt;                     // lam * mu * mu
+    int* ovl_f = (int*)(lmm + Nfilt);            // templates of the overlapping spikes
     int* novl = ovl_f + MAXOVL;
-    int* warp_sum = novl + 1;        // TPBF / 32 entries
+    int* warp_sum = novl + 1;                    // TPBF / 32 entries
     int* nlist = warp_sum + TPBF / 32;
     unsigned char* mark = (unsigned char*)(nlist + 1);
+    __shared__ float part_c[TPBF];
+    __shared__ int part_i[TPBF];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int tq = tid % TQ, r = tid / TQ;
+    const float a = 1 + lam;
+    for (int i = tid; i < Nfilt; i += TPBF) { lm[i] = lam * mu[i]; lmm[i] = lam * mu[i] * mu[i]; }
     const int n1 = counter[1], n0 = min(counter[0], maxFR);
     for (int ind = n1 + blockIdx.x; ind < n0; ind += gridDim.x) {
-        const int s = st[ind], f = id[ind];
+        const int s = st[ind];
         __syncthreads();
         if (tid == 0) { *novl = 0; *nlist = 0; }
         for (int i = tid; i < Nfilt; i += TPBF) mark[i] = 0;
@@ -1039,36 +1089,51 @@ mp_best_filter_update(ptr_t pdout, ptr_t pmu, ptr_t perr, ptr_t pftype, ptr_t ps
             __syncthreads();
         }
         const int nl = *nlist;
-        if (tid < NLAG) {
-            int t = s - NT0 + tid;
-            if (t >= NT0 && t < NT - NT0) {
-                float Cbest = 0.0f, Cnextbest = 0.0f;
-                int ibest = 0;
-                const int istar = ftype[t];
-                if (full || mark[istar]) {
-                    best_at(dout, mu, t, NT, Nfilt, lam, Cbest, Cnextbest, ibest);
-                } else {
-                    const float a = 1 + lam;
-                    bool star_done = false;
-                    for (int j = 0; j <= nl; ++j) {
-                        int i;
-                        if (j < nl) {
-                            i = list[j];
-                            if (!star_done && istar < i) { i = istar; star_done = true; --j; }
-                        } else {
-                            if (star_done) break;
-                            i = istar;
-                            star_done = true;
-                        }
-                        float bb = fmaxf(0.0f, dout[t + (long long)NT * i]) + lam * mu[i];
-                        float Cf = bb * bb / a - lam * mu[i] * mu[i];
-                        if (Cf > Cbest + 1e-6f) { Cnextbest = Cbest; Cbest = Cf; ibest = i; }
-                        else if (Cf > Cnextbest + 1e-6f) Cnextbest = Cf;
-                    }
-                }
-                err[t] = Cbest;
-                ftype[t] = ibest;
+        const int t = s - NT0 + tq;
+        const bool valid = tq < NLAG && t >= NT0 && t < NT - NT0;
+        float Cbest = 0.0f, Cnextbest = 0.0f;
+        int ibest = 0;
+        if (valid) {
+            const float* dt = dout + t;
+            const int istar = ftype[t];
+#define EVAL(i)                                                                                 \
+            {                                                                                   \
+                float bb = fmaxf(0.0f, dt[(long long)NT * (i)]) + lm[i];                        \
+                float Cf = bb * bb / a - lmm[i];                                                \
+                if (Cf > Cbest + 1e-6f) { Cnextbest = Cbest; Cbest = Cf; ibest = (i); }         \
+                else if (Cf > Cnextbest + 1e-6f) Cnextbest = Cf;                                \
             }
+            if (full || mark[istar]) {
+                int i = r;
+                for (; i + 3 * GF < Nfilt; i += 4 * GF) {
+                    int i0 = i, i1 = i + GF, i2 = i + 2 * GF, i3 = i + 3 * GF;
+                    EVAL(i0) EVAL(i1) EVAL(i2) EVAL(i3)
+                }
+                for (; i < Nfilt; i += GF) EVAL(i)
+            } else {
+                if (r == 0) EVAL(istar)
+                int j = r;
+                for (; j + 3 * GF < nl; j += 4 * GF) {
+                    int i0 = list[j], i1 = list[j + GF], i2 = list[j + 2 * GF], i3 = list[j + 3 * GF];
+                    EVAL(i0) EVAL(i1) EVAL(i2) EVAL(i3)
+                }
+                for (; j < nl; j += GF) { int i0 = list[j]; EVAL(i0) }
+            }
+#undef EVAL
+        }
+        part_c[tid] = Cbest;
+        part_i[tid] = ibest;
+        __syncthreads();
+        if (r == 0 && valid) {
+            float C = part_c[tq];
+            int I = part_i[tq];
+            for (int q = 1; q < GF; ++q) {
+                float c = part_c[q * TQ + tq];
+                int i = part_i[q * TQ + tq];
+                if (c > C || (c == C && i < I)) { C = c; I = i; }
+            }
+            err[t] = C;
+            ftype[t] = I;
         }
     }
 }
@@ -1433,9 +1498,10 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
         gspk = max(1, min(4096, NT // nt0 + 1))
         smem_sfu = 4 * (MAXSLOTS * nt0 + Nchan + MAXSLOTS + Nfilt + 2)
         smem_tfu = 4 * (Nfilt + 1)
-        smem_bfu = 4 * (Nfilt + 32 + 1 + 4 + 1) + Nfilt + 16
+        smem_bfu = 4 * (3 * Nfilt + 32 + 1 + 32 + 1) + Nfilt + 16
         sfu.max_dynamic_shared_size_bytes = smem_sfu
         tfu.max_dynamic_shared_size_bytes = smem_tfu
+        bfu.max_dynamic_shared_size_bytes = smem_bfu
         counts = ws['counts']
         if early_stop and nInnerIter > counts.shape[0]:
             counts = torch.empty((nInnerIter, 2), dtype=torch.int32, pin_memory=True)
@@ -1460,7 +1526,7 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
             tfu((gspk,), (TPB,),
                 (_p(dprod), _p(W), _p(UtU), _p(dout), _p(st), _p(sid), _p(counter), *_i32(NT, Nfilt, maxFR)),
                 shared_mem=smem_tfu)
-            bfu((gspk,), (128,),
+            bfu((gspk,), (TPB,),
                 (_p(dout), _p(mu), _p(err), _p(ftype), _p(st), _p(sid), _p(counter), _p(UtU), *_i32(NT, Nfilt),
                  *_f32(lam), *_i32(maxFR)), shared_mem=smem_bfu)
             advance((1,), (1,), (_p(counter), *_i32(maxFR)))
