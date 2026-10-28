@@ -1149,6 +1149,40 @@ class BinaryFiltered(BinaryRWFile):
         N, fh = cached[2], cached[3]
         return irfft(rfft(X, n=N) * fh, n=N)[:, :NT].contiguous()
 
+    def _highpass_circular(self, X):
+        """The default (circular) high-pass filter, with real FFTs of a fast
+        length instead of complex FFTs of length NT + 2*nt.
+
+        The default filter is the circular correlation
+        y[n] = sum_j h[c+j] x[(n + j + o) mod NT] (c: center of the impulse
+        response h, o: offset from the zero padding and fftshift). h decays
+        below float32 resolution within a few hundred samples, so it is
+        truncated to |j| <= E and X is extended circularly by E samples on
+        each side, after which a linear correlation of length >= NT + 2E
+        gives the same result up to rounding (|truncated tail| < 1e-12).
+        """
+        NT = X.shape[1]
+        cached = self.__dict__.get('_fwav_circ')
+        if cached is None or cached[0] is not self.hp_filter or cached[1] != NT:
+            h = self.hp_filter
+            ft = h.shape[0]
+            c = ft // 2
+            if ft < NT:
+                o = (NT - ft) // 2 + c - NT // 2
+            else:
+                o = c - (ft - NT) // 2 - NT // 2 if ft > NT else c - NT // 2
+            N = _fast_fft_length(NT + 2 * 800)
+            E = min((N - NT) // 2, c, ft - 1 - c)
+            g = torch.zeros(N, device=h.device)
+            g[:E+1] = h[c:c+E+1]
+            g[N-E:] = h[c-E:c]
+            idx = (torch.arange(NT + 2*E, device=X.device) - E + o) % NT
+            cached = (self.hp_filter, NT, N, E, torch.conj(rfft(g)), idx)
+            self._fwav_circ = cached
+        N, E, fg, idx = cached[2:]
+        Z = irfft(rfft(X[:, idx], n=N) * fg, n=N)
+        return Z[:, E:E+NT].contiguous()
+
     def filter(self, X, ops=None, ibatch=None, skip_preproc=False,
                selected=False):
         # `selected`: X already has only the chanMap channels, sign-inverted
@@ -1175,6 +1209,8 @@ class BinaryFiltered(BinaryRWFile):
         if self.hp_filter is not None:
             if fast_approx() and self.hp_filter.shape[0] <= X.shape[1]:
                 X = self._highpass_padded(X)
+            elif fastest('hpfilter') and X.shape[1] > 2 * 800:
+                X = self._highpass_circular(X)
             else:
                 fwav = self._fft_highpass(X.shape[1])
                 X = torch.real(ifft(fft(X) * torch.conj(fwav)))
