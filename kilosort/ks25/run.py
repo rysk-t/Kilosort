@@ -6,6 +6,7 @@ code (`learnAndSolve8b`, `find_merges`, `splitAllClusters`, `set_cutoff`,
 `get_good_units`, `rezToPhy`).
 """
 import logging
+import os
 import platform
 import time
 from pathlib import Path
@@ -152,6 +153,12 @@ def run_kilosort25(settings, probe=None, probe_name=None, filename=None,
         rez['yc'] = ops['yc']
         rez['Wrot'] = ops['Wrot']
         ops['runtime_track'] = time.time() - tic
+        dump = os.environ.get('KS25_DUMP_REZ')
+        if dump:
+            # development aid: the state before the post-processing, to run
+            # merges / splits / cutoff on their own (torch.load(dump))
+            torch.save({k: v for k, v in rez.items()}, dump)
+            logger.info(f'rez after trackAndSort saved to {dump}')
         logger.info(f'{len(st3)} spikes extracted in {ops["runtime_track"]:.2f}s; '
                     f'total {time.time()-tic0:.2f}s')
         log_performance(logger, 'info', 'Resource usage after extraction', reset=True)

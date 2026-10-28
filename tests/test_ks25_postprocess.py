@@ -236,6 +236,64 @@ def test_pursuit_against_numpy_equations(flag):
     np.testing.assert_allclose(actual, rs, atol=2e-12, rtol=2e-12)
 
 
+@pytest.mark.parametrize('flag', [True, False])
+def test_batched_pursuit_ragged_degenerate_and_singular(flag):
+    rng = np.random.default_rng(14)
+    features = []
+    for n in (703, 947, 812):
+        raw = rng.normal(size=(n, 3, 2))
+        raw[:n // 2, 0, 0] += 3
+        features.append(raw)
+    features[-1][:, 2, 1] = 0  # Singular covariance requires scalar pinv.
+    features.extend([np.zeros((900, 3, 2)), np.full((800, 3, 2), np.nan)])
+    expected = [pp._bimodal_pursuit(f, flag, 'cpu') for f in features]
+    actual = pp._bimodal_pursuit_batch(features, flag, 'cpu')
+    for a, b in zip(actual, expected):
+        if b is None:
+            assert a is None
+        else:
+            # No sign permutation is allowed: a sign flip swaps child IDs.
+            np.testing.assert_allclose(a, b, atol=1e-10, rtol=1e-10)
+            np.testing.assert_array_equal(a[:, 0] > a[:, 1], b[:, 0] > b[:, 1])
+
+
+@pytest.mark.parametrize('fix', [True, False])
+def test_split_rounds_replay_depth_and_child_queue_exactly(monkeypatch, fix):
+    rez, ops = split_rez(n=3208)
+    for key in ('W', 'U'):
+        rez[key] = rez[key].repeat(1, 2, 1)
+    rez['dWU'] = rez['dWU'].repeat(2, 1, 1)
+    rez['mu'] = rez['mu'].repeat(2)
+    rez['iNeigh'] = np.array([[0, 1], [1, 0]])
+    rez['iNeighPC'] = np.array([[0, 1], [0, 1]])
+    rez['simScore'] = np.array([[.99, .3], [.3, .98]])
+    rez['st3'][:, 1] = np.repeat([0, 1], 1604)
+    rez['cProjPC'][:, 0, 0] = np.tile(np.repeat(np.arange(4), 401), 2)
+    ops['ks25']['fix_split_swap'] = fix
+    def pursuit(features, flag, device):
+        codes = features[:, 0, 0]
+        if codes.min() == codes.max():
+            return None
+        low = codes <= (codes.min() + codes.max()) / 2
+        return np.column_stack((low, ~low)).astype(float)
+    original_waveforms = pp._split_waveforms
+    def waveforms(*args):
+        c1, c2, _, _ = original_waveforms(*args)
+        return c1, c2, torch.tensor(0.), torch.tensor(1.)
+    monkeypatch.setattr(pp, '_bimodal_pursuit', pursuit)
+    monkeypatch.setattr(pp, '_bimodal_pursuit_batch', lambda fs, flag, device: [pursuit(f, flag, device) for f in fs])
+    monkeypatch.setattr(pp, '_split_waveforms', waveforms)
+    monkeypatch.setattr(pp, '_refractory', lambda a, b: (None, 1., 1.))
+    monkeypatch.setattr(pp, '_refit_templates', lambda *args: None)
+    monkeypatch.setenv('KS_FASTEST_OFF', 'ks25_split_batch')
+    scalar = pp.split_all_clusters(copy.deepcopy(rez), ops)
+    monkeypatch.setenv('KS_FASTEST_OFF', '')
+    batched = pp.split_all_clusters(copy.deepcopy(rez), ops)
+    assert scalar['W'].shape[1] == 8
+    for key in ('st3', 'dWU', 'W', 'simScore', 'iNeigh', 'iNeighPC'):
+        np.testing.assert_array_equal(pp._numpy(batched[key]), pp._numpy(scalar[key]))
+
+
 def test_empty_templates_pass_through_postprocessing(tmp_path):
     rez, ops = export_fixture(tmp_path, empty=True)
     for key in ('W', 'U'):

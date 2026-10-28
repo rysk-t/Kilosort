@@ -218,6 +218,98 @@ def _bimodal_pursuit(features, flag, device):
     return _numpy(rs)
 
 
+def _bimodal_pursuit_batch(features, flag, device):
+    """Fifty masked EM iterations, without per-iteration host checks.
+
+    Ragged clusters share batched GEMMs/solves. Singular systems fall back
+    to the scalar pseudoinverse path after the batch, rather than changing
+    the equations with regularization. Initial eigenvectors retain their
+    scalar signs so the two child IDs do not silently exchange places.
+    """
+    result = [None] * len(features)
+    if not features:
+        return result
+    lengths = [len(f) for f in features]
+    count, maximum, dim = len(features), max(lengths), int(np.prod(features[0].shape[1:]))
+    clp = torch.zeros((count, maximum, dim), dtype=torch.float64, device=device)
+    covariance, uncentered_means, valid = [], [], []
+    for j, f in enumerate(features):
+        raw = torch.as_tensor(f, dtype=torch.float64, device=device).reshape(len(f), -1)
+        mean = raw.mean(0)
+        centered = raw - mean
+        finite = torch.isfinite(centered).all()
+        valid.append(finite & (centered.square().sum() > 0))
+        centered = torch.where(finite, centered, 0.)
+        clp[j, :len(f)] = centered
+        # Unpadded GEMMs keep covariance entries identical to scalar init.
+        covariance.append(centered.T @ centered)
+        uncentered_means.append(mean)
+    n = torch.tensor(lengths, dtype=torch.float64, device=device)
+    mask = torch.arange(maximum, device=device)[None, :] < n[:, None]
+    alive = torch.stack(valid)
+    if flag:
+        _, vectors = torch.linalg.eigh(torch.stack(covariance))
+        w = vectors[:, :, -1]
+    else:
+        w = torch.stack(uncentered_means)
+        norm = torch.linalg.vector_norm(w, dim=1)
+        alive &= norm > 0
+        w = w / norm[:, None]
+    w = torch.where(alive[:, None], w, 0.)
+    x = torch.bmm(clp, w[:, :, None]).squeeze(2)
+    midpoint = x.sum(1) / n
+    positive = (x > midpoint[:, None]) & mask
+    negative = (x < midpoint[:, None]) & mask
+    sides = torch.stack((positive, negative), dim=2)
+    sizes = sides.sum(1)
+    alive &= (sizes >= 2).all(1)
+    means = (x[:, :, None] * sides).sum(1) / sizes
+    variances = ((x[:, :, None] - means[:, None, :]).square() * sides).sum(1) / (sizes - 1)
+    p = sizes[:, 0] / n
+    fallback = torch.zeros_like(alive)
+    transpose = clp.transpose(1, 2)
+    identity = torch.eye(dim, dtype=clp.dtype, device=device)[None]
+    for iteration in range(1, 51):
+        alive &= torch.isfinite(variances).all(1) & (variances > 0).all(1) & (p > 0) & (p < 1)
+        safe_var = torch.where(alive[:, None], variances, 1.)
+        safe_mu = torch.where(alive[:, None], means, 0.)
+        safe_p = torch.where(alive, p, .5)
+        logp = (-.5 * safe_var.log()[:, None, :]
+                - (x[:, :, None] - safe_mu[:, None, :]).square() / (2 * safe_var[:, None, :])
+                + torch.stack((safe_p, 1 - safe_p), dim=1).log()[:, None, :])
+        rs = torch.softmax(logp, dim=2) * mask[:, :, None]
+        mass = rs.sum(1)
+        p = rs[:, :, 0].sum(1) / n
+        means = (rs * x[:, :, None]).sum(1) / mass
+        variances = (rs * (x[:, :, None] - means[:, None, :]).square()).sum(1) / mass
+        if iteration > 10 and iteration % 2:
+            alive &= (variances > 0).all(1)
+            safe_var = torch.where(alive[:, None], variances, 1.)
+            weights = (rs / safe_var[:, None, :]).sum(2)
+            StS = torch.bmm(transpose, clp * weights[:, :, None]) / n[:, None, None]
+            target = torch.bmm(rs, (means / safe_var)[:, :, None])
+            StMu = torch.bmm(transpose, target).squeeze(2) / n[:, None]
+            StS = torch.where(alive[:, None, None], StS, identity)
+            StMu = torch.where(alive[:, None], StMu, 0.)
+            lower, info = torch.linalg.cholesky_ex(StS, check_errors=False)
+            y = torch.linalg.solve_triangular(lower, StMu[:, :, None], upper=False)
+            w = torch.linalg.solve_triangular(lower.transpose(1, 2), y, upper=True).squeeze(2)
+            failed = (info != 0) | ~torch.isfinite(w).all(1)
+            fallback |= alive & failed
+            norm = torch.linalg.vector_norm(w, dim=1)
+            alive &= ~failed & torch.isfinite(norm) & (norm > 0)
+            w = torch.where(alive[:, None], w / norm[:, None], 0.)
+            x = torch.bmm(clp, w[:, :, None]).squeeze(2)
+    status = _numpy(torch.stack((alive, fallback), dim=1))
+    responsibilities = _numpy(rs)
+    for j in range(count):
+        if status[j, 1]:
+            result[j] = _bimodal_pursuit(features[j], flag, device)
+        elif status[j, 0]:
+            result[j] = responsibilities[j, :lengths[j]].copy()
+    return result
+
+
 def _refit_templates(rez, ops, iC, iW):
     """Rebuild SVD, lagged similarities and neighbor tables after pursuit."""
     from . import learn
@@ -257,13 +349,16 @@ def split_all_clusters(rez, ops, flag=True):
 
     ``flag`` selects initialization (top PC vs. mean), not whether to split.
     Set ``ks25.fix_split_swap=False`` for MATLAB's swapped child waveform.
-    CCG runs on a CPU worker alongside waveform reconstruction; all parent
-    revisits and template mutations stay ordered on the calling thread.
+    Batched EM evaluates independent clusters in rounds. Replaying the
+    resulting split trees preserves MATLAB's parent-revisit/child-ID order.
+    Disable ``ks25_split_batch`` in KS_FASTEST_OFF for the scalar reference.
     """
-    pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix='ks25-split-ccg')
+    batched = fastest('ks25_split_batch')
+    pool = (ThreadPoolExecutor(max_workers=6 if batched else 1, thread_name_prefix='ks25-split-ccg')
             if fastest('ks25_split_ccg_threads') else nullcontext())
     with pool as executor:
-        return _split_all_clusters(rez, ops, flag, executor)
+        split = _split_rounds if batched else _split_all_clusters
+        return split(rez, ops, flag, executor)
 
 
 def _split_waveforms(features, low, pc, device):
@@ -276,6 +371,131 @@ def _split_waveforms(features, low, pc, device):
     n1, n2 = torch.linalg.vector_norm(a), torch.linalg.vector_norm(b)
     amplitude_difference = 2 * (n1 - n2).abs() / (n1 + n2)
     return c1, c2, correlation, amplitude_difference
+
+
+def _split_chunks(active, nodes, dim, device):
+    # clp, its weighted copy, initial states, and transient linear algebra.
+    budget = 512 * 1024 ** 2
+    if device.type == 'cuda':
+        available = (torch.cuda.mem_get_info(device)[0] + torch.cuda.memory_reserved(device)
+                     - torch.cuda.memory_allocated(device))
+        budget = min(2 * 1024 ** 3, int(available * .25))
+    ordered = sorted(active, key=lambda i: len(nodes[i]['indices']))
+    batch = []
+    for node in ordered:
+        size = len(nodes[node]['indices'])
+        if batch and (len(batch) >= 128 or (len(batch) + 1) * size * dim * 8 * 4 > budget):
+            yield batch
+            batch = []
+        batch.append(node)
+    if batch:
+        yield batch
+
+
+def _split_rounds(rez, ops, flag, ccg_executor):
+    from . import learn
+
+    original = rez['dWU']
+    device = original.device if torch.is_tensor(original) else torch.device('cpu')
+    W = torch.as_tensor(rez['W'], device=device, dtype=torch.float64)
+    dWU = torch.as_tensor(original, device=device, dtype=torch.float64)
+    rank, nroots, nt = W.shape
+    nchan = dWU.shape[1]
+    nnear = min(nchan, int(_opt(ops, 'NchanNear', 32)))
+    local_ops = dict(ops, device=device)
+    for name in ('xc', 'yc'):
+        if name not in local_ops and name in rez:
+            local_ops[name] = rez[name]
+    iC, _, _ = learn.get_closest_channels(local_ops, _opt(ops, 'sigmaMask', 30), nnear)
+    peak = int(_opt(ops, 'nt0min', 20)) - 1
+    if not 0 <= peak < nt:
+        raise ValueError('nt0min must identify a sample in dWU')
+    iW = dWU[:, :, peak].abs().argmax(1).int()
+    pc = torch.as_tensor(rez['wPCA'], device=device, dtype=torch.float64)[:rank]
+    if tuple(pc.shape) != (rank, nt) or rez['cProjPC'].shape[1:] != (rank, nnear):
+        raise ValueError('wPCA/cProjPC must match template rank, nt and channel neighborhood')
+    st = _numpy(rez['st3'])
+    groups = _groups(st[:, 1], nroots)
+    nodes = [dict(indices=indices, root=i) for i, indices in enumerate(groups)]
+    active = [i for i, node in enumerate(nodes) if len(node['indices']) >= 300]
+    fs = float(_opt(ops, 'fs', 30000))
+    threshold = float(_opt(ops, 'AUCsplit', .9))
+    fix_swap = bool(_opt(ops, 'fix_split_swap', True))
+    nsplits = vetoes = round_number = 0
+    while active:
+        round_number += 1
+        evaluated = {}
+        for chunk in _split_chunks(active, nodes, rank * nnear, device):
+            features = [_rows(rez['cProjPC'], nodes[i]['indices']) for i in chunk]
+            responsibilities = _bimodal_pursuit_batch(features, flag, device)
+            for i, f, rs in zip(chunk, features, responsibilities):
+                if rs is None or not np.isfinite(rs).all():
+                    continue
+                low = rs[:, 0] > rs[:, 1]
+                if not low.any() or low.all():
+                    continue
+                ss = st[nodes[i]['indices'], 0] / fs
+                ccg = (ccg_executor.submit(_refractory, ss[low], ss[~low])
+                       if ccg_executor else _refractory(ss[low], ss[~low]))
+                waves = _split_waveforms(f, low, pc, device)
+                evaluated[i] = (low, rs, ccg, waves)
+        following = []
+        for i in active:
+            if i not in evaluated:
+                continue
+            low, rs, ccg, (c1, c2, correlation, amplitude_difference) = evaluated[i]
+            _, Q, R = ccg.result() if ccg_executor else ccg
+            if Q < .25 and R < .05:
+                vetoes += 1
+                continue
+            if bool((correlation > .9) & (amplitude_difference < .2)):
+                continue
+            if (min(low.mean(), (~low).mean()) <= .05 or min(low.sum(), (~low).sum()) <= 300
+                    or min(rs[low, 0].mean(), rs[~low, 1].mean()) <= threshold):
+                continue
+            node = nodes[i]
+            remaining, child = len(nodes), len(nodes) + 1
+            nodes.extend([dict(indices=node['indices'][~low], root=node['root']),
+                          dict(indices=node['indices'][low], root=node['root'])])
+            node['children'] = (remaining, child)
+            node['waves'] = (c2, c1) if fix_swap else (c1, c2)
+            following.extend((remaining, child))
+            nsplits += 1
+        logger.info('Split round %d: checked %d clusters, %d splits, %d CCG vetoes',
+                    round_number, len(active), nsplits, vetoes)
+        active = following
+
+    # Replay exactly the scalar traversal: revisit the remaining parent
+    # immediately, append each new child at the end of the template queue.
+    # This also preserves the original warm starts and simScore==1 ancestry.
+    total = nroots + nsplits
+    waveforms = dWU.new_zeros((total, nchan, nt))
+    waveforms[:nroots] = dWU
+    warm = torch.cat((W, pc[:, None, :].expand(-1, nsplits, -1)), dim=1)
+    sim = np.empty((total, total), dtype=_numpy(rez['simScore']).dtype)
+    sim[:nroots, :nroots] = _numpy(rez['simScore'])
+    queue = list(range(nroots))
+    roots = list(range(nroots))
+    for cluster, index in enumerate(queue):
+        node = nodes[index]
+        while 'children' in node:
+            remaining, child = node['children']
+            new = len(queue)
+            channels = iC[iW[node['root']].long()].long()
+            waveforms[cluster, channels], waveforms[new, channels] = node['waves']
+            sim[:new, new] = sim[:new, cluster]
+            sim[new, :new + 1] = sim[cluster, :new + 1]
+            sim[cluster, new] = sim[new, cluster] = 1
+            queue.append(child)
+            roots.append(node['root'])
+            node = nodes[remaining]
+        st[node['indices'], 1] = cluster
+    iW = iW[torch.as_tensor(roots, device=device, dtype=torch.long)]
+    rez.update(st3=st, dWU=waveforms, W=warm, simScore=sim,
+               iNeigh=_numpy(rez['iNeigh'])[roots], iNeighPC=_numpy(rez['iNeighPC'])[roots])
+    _refit_templates(rez, ops, iC, iW)
+    logger.info('Finished batched pursuit: %d splits, %d CCG vetoes', nsplits, vetoes)
+    return rez
 
 
 def _split_all_clusters(rez, ops, flag, ccg_executor):

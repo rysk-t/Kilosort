@@ -4,12 +4,51 @@ Tensor layouts follow the reversed MATLAB dimensions documented in KS25_BRIEF.
 """
 import logging
 import math
+import os
+import time
+from collections import defaultdict
+from contextlib import contextmanager, nullcontext
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 
+from kilosort.utils import fastest
+
 logger = logging.getLogger(__name__)
+
+
+class _StageTimer:
+    """Optional synchronized wall-clock timings; disabled in normal runs."""
+    def __init__(self, device, label):
+        self.enabled = os.environ.get('KS25_PROFILE') == '1'
+        self.device = device
+        self.label = label
+        self.seconds = defaultdict(float)
+        self.calls = defaultdict(int)
+
+    def measure(self, name):
+        return self._measure(name) if self.enabled else nullcontext()
+
+    @contextmanager
+    def _measure(self, name):
+        if self.device.type == 'cuda':
+            torch.cuda.synchronize(self.device)
+        start = time.perf_counter()
+        try:
+            yield
+        finally:
+            if self.device.type == 'cuda':
+                torch.cuda.synchronize(self.device)
+            self.seconds[name] += time.perf_counter() - start
+            self.calls[name] += 1
+
+    def report(self):
+        if self.enabled:
+            for name, seconds in sorted(self.seconds.items(), key=lambda item: -item[1]):
+                logger.info('KS25_PROFILE %s %s: %.6f s / %d calls (%.3f ms/call)',
+                            self.label, name, seconds, self.calls[name],
+                            seconds * 1000 / self.calls[name])
 
 
 def _opt(ops, name, default=None):
@@ -344,6 +383,47 @@ def _progress(progress_bar, value, total):
             progress_bar.update(1)
 
 
+_update_kernels = {}
+
+
+def _update_running_templates(dWU, batch_sum, counts, pm):
+    """Update the recency-weighted template averages."""
+    counts64 = counts.double()
+    factor = torch.exp(counts64 * math.log(pm))
+    if dWU.is_cuda and fastest('ks25_dwu_fused'):
+        import cupy as cp
+        from kilosort.fused_kernels import _device, _p, _stream
+        with _device(dWU), _stream():
+            device_index = dWU.device.index
+            if device_index not in _update_kernels:
+                source = r"""
+                extern "C" __global__ void update(unsigned long long pold,
+                    unsigned long long psum, unsigned long long pcount,
+                    unsigned long long pfactor, long long length, int width) {
+                    double *old = (double *)pold;
+                    const double *sum = (const double *)psum;
+                    const int *count = (const int *)pcount;
+                    const double *factor = (const double *)pfactor;
+                    long long i = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+                    if (i < length) {
+                        int unit = i / width;
+                        double f = factor[unit];
+                        double n = count[unit] > 0 ? count[unit] : 1;
+                        old[i] = old[i] * f + (1.0 - f) * (sum[i] / n);
+                    }
+                }
+                """
+                _update_kernels[device_index] = cp.RawKernel(source, 'update', options=('--fmad=false',))
+            width = dWU.shape[1] * dWU.shape[2]
+            length = dWU.numel()
+            _update_kernels[device_index](((length + 255) // 256,), (256,),
+                (_p(dWU), _p(batch_sum), _p(counts), _p(factor), np.int64(length), np.int32(width)))
+        return dWU, counts64
+    f = factor[:, None, None]
+    dWU = dWU * f + (1-f) * (batch_sum / counts64.clamp_min(1)[:, None, None])
+    return dWU, counts64
+
+
 def learn_templates(ops, bfile, iorder, progress_bar=None):
     order = np.asarray(iorder, dtype=np.int64).flatten()
     if not len(order):
@@ -355,6 +435,7 @@ def learn_templates(ops, bfile, iorder, progress_bar=None):
     if wTEMP is None or wPCA is None or len(wPCA) < 3:
         wTEMP, wPCA = extract_templates_from_snippets(ops, bfile)
     X = bfile.padded_batch_to_torch(int(order[0]), ops)
+    profile = _StageTimer(X.device, 'learn')
     wTEMP = torch.as_tensor(wTEMP, device=X.device, dtype=torch.float32).contiguous()
     wPCA = torch.as_tensor(wPCA, device=X.device, dtype=torch.float32)[:3].contiguous()
     rank, nt0 = wPCA.shape
@@ -375,53 +456,66 @@ def learn_templates(ops, bfile, iorder, progress_bar=None):
     W = U = dWU = mu = nsp = None
     for step, batch in enumerate(order):
         if step:
-            X = bfile.padded_batch_to_torch(int(batch), ops)
+            with profile.measure('batch_read'):
+                X = bfile.padded_batch_to_torch(int(batch), ops)
         p[0], p[8] = X.shape[1], schedule[step]
         if step == 0:
-            candidates, _ = _backend('get_spikes2', p, X, wTEMP, iC)
+            with profile.measure('get_spikes2'):
+                candidates, _ = _backend('get_spikes2', p, X, wTEMP, iC)
             candidates = candidates[:max_templates].double()
             if not len(candidates):
                 raise ValueError('No initial templates detected in the first learning batch')
             dWU = (candidates @ basis.T) @ basis
             W = basis[:, None, :].expand(-1, len(dWU), -1).clone().contiguous()
             nsp = torch.full((len(dWU),), min_count, dtype=torch.float64, device=X.device)
-        iW = dWU[:, :, int(p[11]) - 1].abs().argmax(dim=1).int()
-        iW, order_idx = torch.sort(iW, stable=True)
-        W, dWU, nsp = W[:, order_idx].contiguous(), dWU[order_idx].contiguous(), nsp[order_idx].contiguous()
-        p[1] = len(dWU)
-        W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
-        utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
-        # No features in training; indices are not read by mexMPnu8.
-        ilist = torch.zeros((len(dWU), nnearest), dtype=torch.int32, device=X.device)
-        result = _backend('mpnu8', p, X, U.float().contiguous(), W.float().contiguous(), mu.float().contiguous(), iC, iW, utu, ilist, wPCA)
-        counts = result['nsp0'].double()
-        factor = torch.exp(counts * math.log(schedule[step]))
-        dWU = dWU * factor[:, None, None] + (1-factor[:, None, None]) * (result['dWU0'] / counts.clamp_min(1)[:, None, None])
-        nsp = .95*nsp + .05*counts
+        with profile.measure('template_order'):
+            iW = dWU[:, :, int(p[11]) - 1].abs().argmax(dim=1).int()
+            iW, order_idx = torch.sort(iW, stable=True)
+            W, dWU, nsp = W[:, order_idx].contiguous(), dWU[order_idx].contiguous(), nsp[order_idx].contiguous()
+            p[1] = len(dWU)
+        with profile.measure('svd_small2'):
+            W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
+        with profile.measure('get_me_utu'):
+            utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
+        with profile.measure('cast_and_ilist'):
+            # No features in training; indices are not read by mexMPnu8.
+            ilist = torch.zeros((len(dWU), nnearest), dtype=torch.int32, device=X.device)
+            U32, W32, mu32 = U.float().contiguous(), W.float().contiguous(), mu.float().contiguous()
+        with profile.measure('mpnu8'):
+            result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA)
+        with profile.measure('dWU_update'):
+            dWU, counts = _update_running_templates(dWU, result['dWU0'], result['nsp0'], schedule[step])
+            nsp = .95*nsp + .05*counts
         if step < len(order)-1:
             if step % 5 == 0:
-                W, U, dWU, mu, nsp, ndrop = triage_templates2(ops, iW, C2C, W, U, dWU, mu, nsp, ndrop)
+                with profile.measure('triage'):
+                    W, U, dWU, mu, nsp, ndrop = triage_templates2(ops, iW, C2C, W, U, dWU, mu, nsp, ndrop)
             p[1] = len(dWU)
             if len(dWU) < max_templates:
-                candidates, _ = _backend('get_spikes2', p, result['drez'], wTEMP, iC)
+                with profile.measure('get_spikes2'):
+                    candidates, _ = _backend('get_spikes2', p, result['drez'], wTEMP, iC)
                 if len(candidates):
                     ndrop[2] = .9*ndrop[2] + .1*len(candidates)
                     candidates = candidates[:max_templates - len(dWU)]
                     if len(candidates):
-                        candidates = candidates.double()
-                        candidates = (candidates @ basis.T) @ basis
-                        dWU = torch.cat((dWU, candidates)).contiguous()
-                        W = torch.cat((W, basis[:, None, :].expand(-1, len(candidates), -1)), dim=1).contiguous()
-                        nsp = torch.cat((nsp, nsp.new_full((len(candidates),), min_count)))
-                        mu = torch.cat((mu, mu.new_full((len(candidates),), 10)))
+                        with profile.measure('candidate_append'):
+                            candidates = candidates.double()
+                            candidates = (candidates @ basis.T) @ basis
+                            dWU = torch.cat((dWU, candidates)).contiguous()
+                            W = torch.cat((W, basis[:, None, :].expand(-1, len(candidates), -1)), dim=1).contiguous()
+                            nsp = torch.cat((nsp, nsp.new_full((len(candidates),), min_count)))
+                            mu = torch.cat((mu, mu.new_full((len(candidates),), 10)))
         if step % 100 == 0:
             logger.info('learning batch %d/%d, %d templates', step+1, len(order), len(dWU))
         _progress(progress_bar, step+1, len(order))
-    W, U, dWU, mu, nsp, ndrop = triage_templates2(ops, iW, C2C, W, U, dWU, mu, nsp, ndrop)
+    with profile.measure('triage'):
+        W, U, dWU, mu, nsp, ndrop = triage_templates2(ops, iW, C2C, W, U, dWU, mu, nsp, ndrop)
     if not len(mu):
         raise ValueError('All learned templates were removed by triage')
-    wtw, ilist = get_me_wtw(W.float(), U.float(), nnearest)
-    iW = dWU[:, :, int(p[11])-1].abs().argmax(dim=1).int()
+    with profile.measure('final_similarity'):
+        wtw, ilist = get_me_wtw(W.float(), U.float(), nnearest)
+        iW = dWU[:, :, int(p[11])-1].abs().argmax(dim=1).int()
+    profile.report()
     return dict(W=W, U=U, mu=mu, dWU=dWU, nsp=nsp, simScore=wtw,
                 iNeigh=ilist, iNeighPC=iC[iW.long()].contiguous(), iC=iC, iW=iW,
                 wPCA=wPCA, wTEMP=wTEMP, ndrop=ndrop)
@@ -435,6 +529,7 @@ def track_and_sort(ops, bfile, rez, progress_bar=None):
     rank, nfilt, nt0 = W.shape
     wPCA = torch.as_tensor(rez['wPCA'], device=device, dtype=torch.float32)[:rank].contiguous()
     X = bfile.padded_batch_to_torch(0, ops)
+    profile = _StageTimer(X.device, 'track')
     iC, mask, _, Ka, Kb, near, nnearest = _setup(ops, X)
     dWU = torch.einsum('rft,rfc,f->fct', W, U, mu).contiguous()
     iW = dWU[:, :, int(_opt(ops, 'nt0min', 20))-1].abs().argmax(dim=1).int()
@@ -447,26 +542,34 @@ def track_and_sort(ops, bfile, rez, progress_bar=None):
     counts = torch.zeros(nfilt, dtype=torch.float64, device=device)
     rows, fw, fpc = [], [], []
     batch_size, pad = int(_opt(ops, 'batch_size', 60000)), int(_opt(ops, 'nt', nt0))
-    W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
-    utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
-    W32, U32, mu32 = W.float().contiguous(), U.float().contiguous(), mu.float().contiguous()
+    with profile.measure('svd_small2'):
+        W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
+    with profile.measure('get_me_utu'):
+        utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
+    with profile.measure('cast'):
+        W32, U32, mu32 = W.float().contiguous(), U.float().contiguous(), mu.float().contiguous()
     for batch in range(bfile.n_batches):
         if batch:
-            X = bfile.padded_batch_to_torch(batch, ops)
+            with profile.measure('batch_read'):
+                X = bfile.padded_batch_to_torch(batch, ops)
         p[0] = X.shape[1]
-        result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA)
-        total += result['dWU0']
-        counts += result['nsp0'].double()
-        keep = (result['st0'] >= pad) & (result['st0'] < pad + batch_size)
-        spike_data = torch.stack(tuple(result[k][keep].to(torch.float64)
-                                       for k in ('st0', 'id0', 'x0', 'vexp')), dim=1).cpu().numpy()
-        spike_data[:, 0] += int(bfile.imin) + batch*batch_size - pad + int(p[11])
-        rows.append(np.column_stack((spike_data, np.full(len(spike_data), batch))))
-        fw.append(result['featW'][keep].cpu().numpy())
-        fpc.append(result['featPC'][keep].cpu().numpy())
+        with profile.measure('mpnu8'):
+            result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA)
+        with profile.measure('dWU_update'):
+            total += result['dWU0']
+            counts += result['nsp0'].double()
+        with profile.measure('D2H_numpy'):
+            keep = (result['st0'] >= pad) & (result['st0'] < pad + batch_size)
+            spike_data = torch.stack(tuple(result[k][keep].to(torch.float64)
+                                           for k in ('st0', 'id0', 'x0', 'vexp')), dim=1).cpu().numpy()
+            spike_data[:, 0] += int(bfile.imin) + batch*batch_size - pad + int(p[11])
+            rows.append(np.column_stack((spike_data, np.full(len(spike_data), batch))))
+            fw.append(result['featW'][keep].cpu().numpy())
+            fpc.append(result['featPC'][keep].cpu().numpy())
         if batch % 100 == 0:
             logger.info('extracting batch %d/%d, %d spikes', batch+1, bfile.n_batches, len(spike_data))
         _progress(progress_bar, batch+1, bfile.n_batches)
+    profile.report()
     rez.update(W=W, U=U, mu=mu, dWU=total / counts.clamp_min(1)[:, None, None], nsp=counts,
                iC=iC, iW=iW, iNeigh=ilist, iNeighPC=iC[iW.long()].contiguous())
     return np.concatenate(rows), np.concatenate(fw), np.concatenate(fpc), rez

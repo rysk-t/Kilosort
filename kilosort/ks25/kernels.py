@@ -22,10 +22,16 @@ Intentional differences from the MATLAB mex files are listed in
 - `svd_small2` never materializes the blanked copy of dWU: the sums run over
   the NchanNear channels of the template (the other channels contribute
   exactly zero);
-- `mpnu8` keeps the spike counter on the device and never blocks on it
-  inside the matching-pursuit loop; with `early_stop=True` (default) the
-  loop ends once an iteration finds no new spike, which is a fixed point of
-  the iteration (same outputs as running all `nInnerIter` iterations);
+- `mpnu8` keeps the spike counter on the device (the kernels loop over the
+  new spikes themselves) and only synchronizes with the host every
+  `sync_every` iterations; with `early_stop=True` (default) the loop ends
+  once an iteration finds no new spike, which is a fixed point of the
+  iteration (same outputs as running all `nInnerIter` iterations). The
+  subtraction only touches the NchanNear channels of the template (U is
+  zero elsewhere), the three updates after a subtraction round are
+  organized per spike instead of per template, and average_snips visits the
+  spikes grouped by template; the sums are accumulated in the original
+  order;
 - with `matlab_tail=False` (default) the whole batch is scanned for spikes;
   `matlab_tail=True` reproduces the loop bounds of the mex files, which
   leave the last ~Nthreads+nt0 samples of a batch unscanned.
@@ -38,6 +44,7 @@ import torch
 
 _modules = {}
 TPB = 1024  # Nthreads of the mex files
+MAXSLOTS = 192  # channels of a spike's data window kept in shared memory (mpnu8)
 
 
 def _function(src_name, name, defines=()):
@@ -711,8 +718,27 @@ mp_space_filter(ptr_t pdata, ptr_t pU, ptr_t piC, ptr_t piW, ptr_t pdprod, int N
     }
 }
 
-// spaceFilterUpdate: recompute dprod around the new spikes for the
-// templates that overlap them (UtU), from the float or double residual.
+// The updates after a subtraction round. The originals
+// (spaceFilterUpdate / timeFilterUpdate / bestFilterUpdate) use one block
+// per template that walks the list of new spikes serially (a chain of
+// dependent loads per spike) and re-reads the data window of a spike once
+// per overlapping template. Here one block handles one new spike: it lists
+// the templates that overlap it (UtU), and the spatial update gathers the
+// data window of the union of their channels into shared memory once. The
+// sums are accumulated in the same order as the original kernels.
+
+// list of the templates overlapping template f: mlist[0..*nm)
+__device__ __forceinline__ void overlapping(const bool* UtU, int f, int Nfilt, int* mlist, int* nm)
+{
+    for (int bid = threadIdx.x; bid < Nfilt; bid += blockDim.x)
+        if (UtU[f + (long long)Nfilt * bid]) mlist[atomicAdd(nm, 1)] = bid;
+}
+
+// spaceFilterUpdate: dprod of the overlapping templates at [st, st + NT0)
+// (the original recomputes [st - NT0, st + NT0); the residual only changes
+// in [st, st + NT0), one time point of data per value).
+// dynamic shared memory: win[MAXSLOTS * NT0] floats, slot[Nchan] ints,
+// chan_of[MAXSLOTS] ints, mlist[Nfilt] ints, counters.
 #define SPACE_FILTER_UPDATE(NAME, T)                                                            \
 extern "C" __global__                                                                           \
 void NAME(ptr_t pdata, ptr_t pU, ptr_t pUtU, ptr_t piC, ptr_t piW, ptr_t pdprod,                \
@@ -727,25 +753,55 @@ void NAME(ptr_t pdata, ptr_t pU, ptr_t pUtU, ptr_t piC, ptr_t piW, ptr_t pdprod,
     const int* st = (const int*)pst;                                                            \
     const int* id = (const int*)pid;                                                            \
     const int* counter = (const int*)pcounter;                                                  \
-    __shared__ float sU[NCHANU * NRANK];                                                        \
-    __shared__ const T* rows[NCHANU];                                                           \
-    const int tid = threadIdx.x, bid = blockIdx.x;                                              \
-    if (tid < NCHANU) {                                                                         \
-        int c = iC[tid + NCHANU * iW[bid]];                                                     \
-        rows[tid] = data + (long long)NT * c;                                                   \
-        for (int k = 0; k < NRANK; ++k) sU[tid + k * NCHANU] = U[c + Nchan * (bid + (long long)Nfilt * k)]; \
-    }                                                                                           \
-    __syncthreads();                                                                            \
+    extern __shared__ float smem[];                                                             \
+    float* win = smem;                                                                          \
+    int* slot = (int*)(smem + MAXSLOTS * NT0);                                                  \
+    int* chan_of = slot + Nchan;                                                                \
+    int* mlist = chan_of + MAXSLOTS;                                                            \
+    int* nm = mlist + Nfilt;                                                                    \
+    int* nslots = nm + 1;                                                                       \
+    const int tid = threadIdx.x;                                                                \
     const int n1 = counter[1], n0 = min(counter[0], maxFR);                                     \
-    for (int ind = n1; ind < n0; ++ind) {                                                       \
-        if (UtU[id[ind] + (long long)Nfilt * bid]) {                                            \
-            int t = st[ind] + tid - NT0;                                                        \
-            if (t >= 0 && t < NT) {                                                             \
-                float x[NRANK];                                                                 \
-                PROJECT(T, rows, t, x)                                                          \
-                _Pragma("unroll")                                                               \
-                for (int k = 0; k < NRANK; ++k) dprod[t + (long long)NT * (bid + k * Nfilt)] = x[k]; \
+    for (int ind = n1 + blockIdx.x; ind < n0; ind += gridDim.x) {                               \
+        const int s = st[ind], f = id[ind];                                                     \
+        __syncthreads();                                                                        \
+        for (int c = tid; c < Nchan; c += blockDim.x) slot[c] = -1;                             \
+        if (tid == 0) { *nm = 0; *nslots = 0; }                                                 \
+        __syncthreads();                                                                        \
+        overlapping(UtU, f, Nfilt, mlist, nm);                                                  \
+        __syncthreads();                                                                        \
+        const int m = *nm;                                                                      \
+        for (int i = tid; i < m * NCHANU; i += blockDim.x)                                      \
+            slot[iC[i % NCHANU + NCHANU * iW[mlist[i / NCHANU]]]] = 0;                          \
+        __syncthreads();                                                                        \
+        for (int c = tid; c < Nchan; c += blockDim.x)                                           \
+            if (slot[c] == 0) { int j = atomicAdd(nslots, 1); slot[c] = j; if (j < MAXSLOTS) chan_of[j] = c; } \
+        __syncthreads();                                                                        \
+        const bool gathered = *nslots <= MAXSLOTS;                                              \
+        if (gathered) {                                                                         \
+            for (int i = tid; i < *nslots * NT0; i += blockDim.x) {                             \
+                int j = i / NT0, t = i - j * NT0;                                               \
+                win[i] = (s + t < NT) ? (float)(data[s + t + (long long)NT * chan_of[j]]) : 0.0f; \
             }                                                                                   \
+        }                                                                                       \
+        __syncthreads();                                                                        \
+        for (int i = tid; i < m * NT0; i += blockDim.x) {                                       \
+            int j = i / NT0, t = i - j * NT0;                                                   \
+            int bid = mlist[j];                                                                 \
+            if (s + t >= NT) continue;                                                          \
+            const int* row = iC + NCHANU * iW[bid];                                             \
+            const float* u = U + Nchan * bid;                                                   \
+            float x[NRANK];                                                                     \
+            _Pragma("unroll")                                                                   \
+            for (int k = 0; k < NRANK; ++k) x[k] = 0.0f;                                        \
+            for (int i2 = 0; i2 < NCHANU; ++i2) {                                               \
+                int c = row[i2];                                                                \
+                float d = gathered ? win[slot[c] * NT0 + t] : (float)(data[s + t + (long long)NT * c]); \
+                _Pragma("unroll")                                                               \
+                for (int k = 0; k < NRANK; ++k) x[k] += u[c + (long long)Nchan * Nfilt * k] * d; \
+            }                                                                                   \
+            _Pragma("unroll")                                                                   \
+            for (int k = 0; k < NRANK; ++k) dprod[s + t + (long long)NT * (bid + k * Nfilt)] = x[k]; \
         }                                                                                       \
     }                                                                                           \
 }
@@ -788,10 +844,16 @@ void mp_time_filter(ptr_t pdprod, ptr_t pW, ptr_t pdout, int NT, int Nfilt, int 
     }
 }
 
-// timeFilterUpdate: recompute dout around the new spikes
-extern "C" __global__
-void mp_time_filter_update(ptr_t pdprod, ptr_t pW, ptr_t pUtU, ptr_t pdout, ptr_t pst, ptr_t pid,
-                           ptr_t pcounter, int NT, int Nfilt, int maxFR)
+// timeFilterUpdate: dout of the overlapping templates at [st - NT0, st + NT0)
+// (block per spike, one warp per template, each lane computes TR
+// consecutive outputs from a sliding window of the dprod row, so each
+// value is loaded once per lane instead of once per output; the terms of
+// each output are still accumulated in the original order).
+// dynamic shared memory: mlist[Nfilt] ints + counter.
+#define TR 4
+extern "C" __global__ void __launch_bounds__(TPB)
+mp_time_filter_update(ptr_t pdprod, ptr_t pW, ptr_t pUtU, ptr_t pdout, ptr_t pst, ptr_t pid,
+                      ptr_t pcounter, int NT, int Nfilt, int maxFR)
 {
     const float* dprod = (const float*)pdprod;
     const float* W = (const float*)pW;
@@ -800,22 +862,42 @@ void mp_time_filter_update(ptr_t pdprod, ptr_t pW, ptr_t pUtU, ptr_t pdout, ptr_
     const int* st = (const int*)pst;
     const int* id = (const int*)pid;
     const int* counter = (const int*)pcounter;
-    __shared__ float sW[NT0 * NRANK];
-    const int tid = threadIdx.x, bid = blockIdx.x;
-    if (tid < NT0)
-        for (int k = 0; k < NRANK; ++k) sW[tid + k * NT0] = W[tid + NT0 * (bid + (long long)Nfilt * k)];
-    __syncthreads();
+    extern __shared__ int mlist[];
+    int* nm = mlist + Nfilt;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5, nwarps = blockDim.x >> 5;
     const int n1 = counter[1], n0 = min(counter[0], maxFR);
-    for (int ind = n1; ind < n0; ++ind) {
-        if (UtU[id[ind] + (long long)Nfilt * bid]) {
-            int tid0 = st[ind] - NT0 + tid;
-            if (tid0 >= 0 && tid0 < NT - NT0) {
-                float x = 0.0f;
-                for (int k = 0; k < NRANK; ++k) {
-                    const float* src = dprod + tid0 + (long long)NT * (bid + (long long)Nfilt * k);
-                    for (int t = 0; t < NT0; ++t) x += sW[t + k * NT0] * src[t];
+    for (int ind = n1 + blockIdx.x; ind < n0; ind += gridDim.x) {
+        const int s = st[ind], f = id[ind];
+        __syncthreads();
+        if (tid == 0) *nm = 0;
+        __syncthreads();
+        overlapping(UtU, f, Nfilt, mlist, nm);
+        __syncthreads();
+        const int m = *nm;
+        for (int j = warp; j < m; j += nwarps) {
+            const int bid = mlist[j];
+            const int base = s - NT0 + lane * TR;  // outputs base .. base + TR - 1
+            float x[TR];
+            #pragma unroll
+            for (int jj = 0; jj < TR; ++jj) x[jj] = 0.0f;
+            for (int k = 0; k < NRANK; ++k) {
+                const float* src = dprod + (long long)NT * (bid + (long long)Nfilt * k);
+                const float* w = W + NT0 * (bid + (long long)Nfilt * k);
+                for (int t = 0; t < NT0 + TR - 1; ++t) {
+                    int tt = base + t;
+                    float d = (tt >= 0 && tt < NT) ? src[tt] : 0.0f;
+                    #pragma unroll
+                    for (int jj = 0; jj < TR; ++jj) {
+                        int tp = t - jj;
+                        if (tp >= 0 && tp < NT0) x[jj] += w[tp] * d;
+                    }
                 }
-                dout[tid0 + (long long)NT * bid] = x;
+            }
+            #pragma unroll
+            for (int jj = 0; jj < TR; ++jj) {
+                int tid0 = base + jj;
+                if (lane * TR + jj < NLAG && tid0 >= 0 && tid0 < NT - NT0)
+                    dout[tid0 + (long long)NT * bid] = x[jj];
             }
         }
     }
@@ -856,7 +938,8 @@ void mp_best_filter(ptr_t pdout, ptr_t pmu, ptr_t perr, ptr_t peloss, ptr_t pfty
 }
 
 // bestFilterUpdate: recompute err / ftype around the new spikes (eloss is
-// not updated, as in the original)
+// not updated, as in the original). The original allows t < NT; its loop
+// bounds never reach the tail, and err is only defined for t < NT - NT0.
 extern "C" __global__
 void mp_best_filter_update(ptr_t pdout, ptr_t pmu, ptr_t perr, ptr_t pftype, ptr_t pst, ptr_t pcounter,
                            int NT, int Nfilt, float lam, int maxFR)
@@ -870,8 +953,6 @@ void mp_best_filter_update(ptr_t pdout, ptr_t pmu, ptr_t perr, ptr_t pftype, ptr
     const int n1 = counter[1], n0 = min(counter[0], maxFR);
     for (int ind = n1 + blockIdx.x; ind < n0; ind += gridDim.x) {
         int t = st[ind] - NT0 + threadIdx.x;
-        // the original allows t < NT; its loop bounds never reach the tail,
-        // and err is only defined for t < NT - NT0 (bestFilter)
         if (t >= NT0 && t < NT - NT0) {
             float Cbest, Cnextbest;
             int ibest;
@@ -957,11 +1038,14 @@ void mp_extract_feat(ptr_t pst, ptr_t pid, ptr_t pcounter, ptr_t pdout, ptr_t pi
     }
 }
 
-// subtract_spikes (float atomics) / subtract_spikes_v4 (double atomics)
+// subtract_spikes (float atomics) / subtract_spikes_v4 (double atomics).
+// The original loops over all channels; U is zero outside the NCHANU
+// channels of the template (mexSVDsmall2 blanks them), so only those are
+// touched here (adding -0 or +0 would leave the value unchanged).
 #define SUBTRACT_SPIKES(NAME, T)                                                                \
 extern "C" __global__                                                                           \
 void NAME(ptr_t pst, ptr_t pid, ptr_t py, ptr_t pcounter, ptr_t pdata, ptr_t pW, ptr_t pU,      \
-          int NT, int Nchan, int Nfilt, int maxFR)                                              \
+          ptr_t piC, ptr_t piW, int NT, int Nchan, int Nfilt, int maxFR)                        \
 {                                                                                               \
     const int* st = (const int*)pst;                                                            \
     const int* id = (const int*)pid;                                                            \
@@ -970,14 +1054,19 @@ void NAME(ptr_t pst, ptr_t pid, ptr_t py, ptr_t pcounter, ptr_t pdata, ptr_t pW,
     T* data = (T*)pdata;                                                                        \
     const float* W = (const float*)pW;                                                          \
     const float* U = (const float*)pU;                                                          \
+    const int* iC = (const int*)piC;                                                            \
+    const int* iW = (const int*)piW;                                                            \
     const int tidx = threadIdx.x;                                                               \
     const int n0 = min(counter[0], maxFR);                                                      \
     for (int ind = counter[1] + blockIdx.x; ind < n0; ind += gridDim.x) {                       \
-        for (int tidy = threadIdx.y; tidy < Nchan; tidy += blockDim.y) {                        \
+        const int f = id[ind];                                                                  \
+        const int* row = iC + NCHANU * iW[f];                                                   \
+        for (int j = threadIdx.y; j < NCHANU; j += blockDim.y) {                                \
+            int tidy = row[j];                                                                  \
             T X = 0;                                                                            \
             for (int k = 0; k < NRANK; ++k)                                                     \
-                X += (T)(W[tidx + id[ind] * NT0 + (long long)NT0 * Nfilt * k]) *                \
-                     (T)(U[tidy + id[ind] * Nchan + (long long)Nchan * Nfilt * k]);             \
+                X += (T)(W[tidx + f * NT0 + (long long)NT0 * Nfilt * k]) *                      \
+                     (T)(U[tidy + f * Nchan + (long long)Nchan * Nfilt * k]);                   \
             X = -(T)(y[ind]) * X;                                                               \
             atomicAdd(&data[tidx + st[ind] + (long long)NT * tidy], X);                         \
         }                                                                                       \
@@ -1040,14 +1129,21 @@ void mp_pc_features(ptr_t pdata, ptr_t pst, ptr_t pid, ptr_t py, ptr_t pW, ptr_t
 }
 
 // average_snips: sum of the reconstructed spikes with vexp > Th per template
-// (in the order given by idx), and their count
-extern "C" __global__
-void mp_average_snips(ptr_t pst, ptr_t pidx, ptr_t pid, ptr_t px, ptr_t py, ptr_t pdata, ptr_t pW, ptr_t pU,
-                      ptr_t pWU, ptr_t pnsp, int NT, int Nchan, int Nfilt, int n, float Th)
+// and their count. The spikes of template bid are order[offsets[bid] ..
+// offsets[bid+1]) (grouped by template on the host, in the order the
+// original would visit them), so each block only visits its own spikes.
+// Each thread owns the (t, channel) elements it accumulates (in registers,
+// written once), and the template value W*U of an element is computed once.
+// The channels are split over CSPLIT blocks (grid.y) to bound the registers.
+#define CSPLIT 4
+#define CHPT ((NCHAN + 16 * CSPLIT - 1) / (16 * CSPLIT))
+extern "C" __global__ void __launch_bounds__(TPB)
+mp_average_snips(ptr_t pst, ptr_t porder, ptr_t poffsets, ptr_t px, ptr_t py, ptr_t pdata, ptr_t pW, ptr_t pU,
+                      ptr_t pWU, ptr_t pnsp, int NT, int Nchan, int Nfilt, float Th)
 {
     const int* st = (const int*)pst;
-    const int* idx = (const int*)pidx;
-    const int* id = (const int*)pid;
+    const int* order = (const int*)porder;
+    const int* offsets = (const int*)poffsets;
     const float* x = (const float*)px;
     const float* y = (const float*)py;
     const float* data = (const float*)pdata;
@@ -1056,18 +1152,38 @@ void mp_average_snips(ptr_t pst, ptr_t pidx, ptr_t pid, ptr_t px, ptr_t py, ptr_
     double* WU = (double*)pWU;
     int* nsp = (int*)pnsp;
     const int tidx = threadIdx.x, bid = blockIdx.x;
-    for (int ind = 0; ind < n; ++ind) {
-        int cur = idx[ind];
-        if (x[cur] > Th && id[cur] == bid) {
-            if (tidx == 0 && threadIdx.y == 0) nsp[bid]++;
-            for (int tidy = threadIdx.y; tidy < Nchan; tidy += blockDim.y) {
-                double X = 0.0;
-                for (int k = 0; k < NRANK; ++k)
-                    X += W[tidx + bid * NT0 + (long long)NT0 * Nfilt * k] * U[tidy + bid * Nchan + (long long)Nchan * Nfilt * k];
-                double xsum = data[st[cur] + tidx + (long long)NT * tidy] + y[cur] * X;
-                WU[tidx + tidy * NT0 + (long long)NT0 * Nchan * bid] += xsum;
+    const int ty0 = blockIdx.y * 16 * CHPT + threadIdx.y;
+    const int i0 = offsets[bid], i1 = offsets[bid + 1];
+    if (i0 == i1) return;
+    double X[CHPT], acc[CHPT];
+    #pragma unroll
+    for (int j = 0; j < CHPT; ++j) {
+        int tidy = ty0 + 16 * j;
+        X[j] = 0.0;
+        acc[j] = 0.0;
+        if (tidy < Nchan)
+            for (int k = 0; k < NRANK; ++k)
+                X[j] += W[tidx + bid * NT0 + (long long)NT0 * Nfilt * k] * U[tidy + bid * Nchan + (long long)Nchan * Nfilt * k];
+    }
+    int count = 0;
+    for (int ind = i0; ind < i1; ++ind) {
+        int cur = order[ind];
+        if (x[cur] > Th) {
+            ++count;
+            const float* d = data + st[cur] + tidx;
+            const float yc = y[cur];
+            #pragma unroll
+            for (int j = 0; j < CHPT; ++j) {
+                int tidy = ty0 + 16 * j;
+                if (tidy < Nchan) acc[j] += d[(long long)NT * tidy] + yc * X[j];
             }
         }
+    }
+    if (tidx == 0 && threadIdx.y == 0 && blockIdx.y == 0) nsp[bid] += count;
+    #pragma unroll
+    for (int j = 0; j < CHPT; ++j) {
+        int tidy = ty0 + 16 * j;
+        if (tidy < Nchan) WU[tidx + tidy * NT0 + (long long)NT0 * Nchan * bid] += acc[j];
     }
 }
 """
@@ -1146,7 +1262,7 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
     wPCA = _tensor(wPCA, torch.float32, None, 'wPCA', dev)
     if wPCA.shape[0] < Nrank or wPCA.shape[1] != nt0:
         raise ValueError('wPCA must be (>=Nrank, nt0)')
-    if nt0 * Nrank > TPB or NchanU * Nrank > TPB or NchanU > TPB or 16 * Nnearest > TPB:
+    if nt0 * Nrank > TPB or NchanU * Nrank > TPB or NchanU > TPB or 16 * Nnearest > TPB or 16 * nt0 > TPB:
         raise ValueError('unsupported nt0 / Nrank / NchanNear / Nnearest')
     if 2 * nt0 - 1 > TPB:
         raise ValueError('nt0 too large')
@@ -1161,7 +1277,8 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
                nsp0=torch.zeros(Nfilt, dtype=torch.int32, device=dev), drez=drez)
     if Nfilt == 0 or NT < 2 * nt0 or nInnerIter <= 0:
         return out
-    defs = (('NT0', nt0), ('NRANK', Nrank), ('NCHANU', NchanU), ('TPB', TPB))
+    defs = (('NT0', nt0), ('NRANK', Nrank), ('NCHANU', NchanU), ('TPB', TPB),
+            ('MAXSLOTS', MAXSLOTS), ('NCHAN', Nchan))
     kern = lambda name: _function('mpnu', name, defs)
 
     with _device(X), _stream():
@@ -1199,7 +1316,14 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
         bfu = kern('mp_best_filter_update')
         advance = kern('mp_advance_counter')
         ty = max(1, min(16, TPB // nt0))
-        gupd = min(256, Nfilt) if Nfilt > 0 else 1
+        # the new spikes of an iteration are local maxima over +-(nt0-1), so
+        # there are at most about NT / nt0 of them: one block each
+        gspk = max(1, min(4096, NT // nt0 + 1))
+        gupd = min(256, Nfilt)
+        smem_sfu = 4 * (MAXSLOTS * nt0 + Nchan + MAXSLOTS + Nfilt + 2)
+        smem_tfu = 4 * (Nfilt + 1)
+        sfu.max_dynamic_shared_size_bytes = smem_sfu
+        tfu.max_dynamic_shared_size_bytes = smem_tfu
         counts = ws['counts']
         if early_stop and nInnerIter > counts.shape[0]:
             counts = torch.empty((nInnerIter, 2), dtype=torch.int32, pin_memory=True)
@@ -1216,13 +1340,14 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
                              (_p(st), _p(sid), _p(counter), _p(dout), _p(iList), _p(mu), _p(feat),
                               *_i32(NT, Nnearest), *_f32(lam), *_i32(maxFR)))
             subtract((Nfilt,), (nt0, ty),
-                     (_p(st), _p(sid), _p(y), _p(counter), _p(data_sub), _p(W), _p(U),
+                     (_p(st), _p(sid), _p(y), _p(counter), _p(data_sub), _p(W), _p(U), _p(iC), _p(iW),
                       *_i32(NT, Nchan, Nfilt, maxFR)))
-            sfu((Nfilt,), (2 * nt0 - 1,),
+            sfu((gspk,), (TPB,),
                 (_p(data_sub), _p(U), _p(UtU), _p(iC), _p(iW), _p(dprod), _p(st), _p(sid), _p(counter),
-                 *_i32(NT, Nfilt, Nchan, maxFR)))
-            tfu((Nfilt,), (2 * nt0 - 1,),
-                (_p(dprod), _p(W), _p(UtU), _p(dout), _p(st), _p(sid), _p(counter), *_i32(NT, Nfilt, maxFR)))
+                 *_i32(NT, Nfilt, Nchan, maxFR)), shared_mem=smem_sfu)
+            tfu((gspk,), (TPB,),
+                (_p(dprod), _p(W), _p(UtU), _p(dout), _p(st), _p(sid), _p(counter), *_i32(NT, Nfilt, maxFR)),
+                shared_mem=smem_tfu)
             bfu((gupd,), (2 * nt0 - 1,),
                 (_p(dout), _p(mu), _p(err), _p(ftype), _p(st), _p(counter), *_i32(NT, Nfilt), *_f32(lam),
                  *_i32(maxFR)))
@@ -1244,15 +1369,24 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
             kern('mp_pc_features')((Nfilt,), (NchanU, Nrank),
                                    (_p(drez), _p(st), _p(sid), _p(y), _p(W), _p(U), _p(iW), _p(iC), _p(wPCA),
                                     _p(featPC), *_i32(NT, Nchan, Nfilt, n)))
-        if stable and n > 0:
-            idx = torch.argsort(st[:n], stable=True).to(torch.int32).contiguous()
-        else:
-            idx = torch.arange(n, dtype=torch.int32, device=dev)
         dWU0, nsp0 = out['dWU0'], out['nsp0']
         if n > 0:
-            kern('mp_average_snips')((Nfilt,), (nt0, ty),
-                                     (_p(st), _p(idx), _p(sid), _p(x), _p(y), _p(drez), _p(W), _p(U),
-                                      _p(dWU0), _p(nsp0), *_i32(NT, Nchan, Nfilt, n), *_f32(Th2)))
+            # visiting order of the original: time-sorted in stable mode,
+            # detection order otherwise; then grouped by template (stable)
+            ids = sid[:n].long()
+            if stable:
+                idx = torch.argsort(st[:n], stable=True)
+                ids = ids[idx]
+            else:
+                idx = torch.arange(n, device=dev)
+            perm = torch.argsort(ids, stable=True)
+            order = idx[perm].to(torch.int32).contiguous()
+            offsets = torch.zeros(Nfilt + 1, dtype=torch.int64, device=dev)
+            offsets[1:] = torch.cumsum(torch.bincount(ids, minlength=Nfilt), 0)
+            offsets = offsets.to(torch.int32).contiguous()
+            kern('mp_average_snips')((Nfilt, 4), (nt0, 16),
+                                     (_p(st), _p(order), _p(offsets), _p(x), _p(y), _p(drez), _p(W), _p(U),
+                                      _p(dWU0), _p(nsp0), *_i32(NT, Nchan, Nfilt), *_f32(Th2)))
         out.update(st0=st[:n].clone(), id0=sid[:n].clone(), x0=y[:n].clone(), vexp=x[:n].clone(),
                    featW=feat[:n].clone() if flag > 1 else torch.zeros((n, Nnearest), device=dev),
                    featPC=featPC)

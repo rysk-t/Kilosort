@@ -272,3 +272,47 @@ def test_learning_skips_candidate_detection_at_capacity(monkeypatch):
 def test_device_accepts_torch_device_key():
     assert learn._device({'torch_device': torch.device('cpu')}) == torch.device('cpu')
     assert learn._device({'device': 'cpu', 'torch_device': 'cuda'}) == torch.device('cpu')
+
+
+def test_stage_timer_is_opt_in(monkeypatch, caplog):
+    import logging
+    monkeypatch.delenv('KS25_PROFILE', raising=False)
+    timer = learn._StageTimer(torch.device('cpu'), 'test')
+    with timer.measure('work'):
+        pass
+    timer.report()
+    assert not timer.seconds and 'KS25_PROFILE' not in caplog.text
+    monkeypatch.setenv('KS25_PROFILE', '1')
+    with caplog.at_level(logging.INFO, logger=learn.__name__):
+        timer = learn._StageTimer(torch.device('cpu'), 'test')
+        with timer.measure('work'):
+            pass
+        timer.report()
+    assert timer.calls['work'] == 1
+    assert 'KS25_PROFILE test work:' in caplog.text
+
+
+def test_in_place_template_update_matches_original_formula():
+    torch.manual_seed(27)
+    old = torch.randn((4, 3, 7), dtype=torch.float64)
+    batch_sum = torch.randn_like(old)
+    counts = torch.tensor([0, 1, 7, 100], dtype=torch.int32)
+    pm = .997
+    factor = torch.exp(counts.double() * np.log(pm))[:, None, None]
+    expected = old * factor + (1-factor) * (batch_sum / counts.double().clamp_min(1)[:, None, None])
+    result, updated_counts = learn._update_running_templates(old.clone(), batch_sum.clone(), counts, pm)
+    assert torch.equal(result, expected)
+    torch.testing.assert_close(updated_counts, counts.double())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+def test_gpu_fused_template_update_is_bit_identical(monkeypatch):
+    torch.manual_seed(45)
+    old = torch.randn((4, 9, 61), dtype=torch.float64, device='cuda')
+    batch_sum = torch.randn_like(old)
+    counts = torch.tensor([0, 1, 7, 100], dtype=torch.int32, device='cuda')
+    monkeypatch.setenv('KS_FASTEST_OFF', 'ks25_dwu_fused')
+    expected, _ = learn._update_running_templates(old.clone(), batch_sum, counts, .997)
+    monkeypatch.delenv('KS_FASTEST_OFF')
+    actual, _ = learn._update_running_templates(old.clone(), batch_sum, counts, .997)
+    assert torch.equal(actual, expected)
