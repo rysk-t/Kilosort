@@ -41,6 +41,14 @@ def fastest(feature):
     return feature not in {f.strip() for f in off.split(',')}
 
 
+def trying(feature):
+    """True if `feature` is listed in the KS_FASTEST_TRY environment variable
+    (comma separated): changes of this branch that are off by default
+    because they changed the results on test data."""
+    on = os.environ.get('KS_FASTEST_TRY', '')
+    return feature in {f.strip() for f in on.split(',')}
+
+
 def stable_argsort(a, device=None):
     """np.argsort(a, kind='stable'), on `device` for large integer arrays
     when it is a CUDA device (a stable sort has only one answer, so the
