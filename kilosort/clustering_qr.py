@@ -122,9 +122,38 @@ def _counts(idx, n, like):
     return c.unsqueeze(0)
 
 
+def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
+    """Same result as the dense `assign_iclust` for lam > 0, without the
+    (n_spikes, nclust) score matrix.
+
+    A spike's score for cluster c is (number of its neighbors in c) - a*kN[c]
+    with a = lam/m * ki >= 0, so only the clusters of its neighbors and the
+    best other cluster (smallest kN, then smallest index) can win. The scores
+    are computed with the same operations as the dense version, and ties go
+    to the smallest cluster index as in torch.argmax.
+    """
+    L = isub[kn]                                   # (n_spikes, n_neigh)
+    K = L.shape[1]
+    kN = _counts(isub, nclust, tones2)[0]
+    cnt = (L.unsqueeze(2) == L.unsqueeze(1)).sum(2).to(tones2.dtype)
+    s_nb = cnt - lam/m * (ki.unsqueeze(-1) * kN[L])
+    # Best cluster outside the neighbors: first of the K+1 smallest kN
+    # (stable sort keeps the index order for equal kN) that no neighbor has.
+    top = torch.sort(kN, stable=True).indices[:K+1]
+    taken = (L.unsqueeze(2) == top.view(1, 1, -1)).any(1)
+    c_out = top[(~taken).to(torch.uint8).argmax(1)]
+    s_out = torch.zeros_like(ki) - lam/m * (ki * kN[c_out])
+    S = torch.cat((s_nb, s_out.unsqueeze(1)), 1)
+    ids = torch.cat((L, c_out.unsqueeze(1)), 1)
+    best = S.max(1, keepdim=True).values
+    return torch.where(S == best, ids, nclust).min(1).values
+
+
 def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=torch.device('cuda')):
     n_spikes = kn.shape[0]
     nclust = int(nclust)
+    if lam > 0 and nclust > kn.shape[1] and fastest('sparse_assign'):
+        return _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki)
 
     # Dense version of coo((rows_neigh, isub[kn]), tones2).to_dense(), built
     # directly with scatter_add_ (same values, far fewer kernels).
