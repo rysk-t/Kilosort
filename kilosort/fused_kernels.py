@@ -22,6 +22,7 @@ integer ``N`` checks the first N calls, and ``all`` checks every call. With an e
 raises an error, so a full run with ``KILOSORT_FUSED_VERIFY=all`` proves that
 the kernels are bit-identical on that data.
 """
+import itertools
 import logging
 import os
 import warnings
@@ -94,6 +95,20 @@ def _signature(args, kwargs):
     return (tuple(sig(a) for a in args), tuple((k, sig(v)) for k, v in kwargs.items()))
 
 
+def _on_device(fused, args, kwargs):
+    """Call `fused` with PyTorch's and CuPy's current device set to the
+    device of its first CUDA tensor argument, so that the kernels are loaded
+    and launched on that GPU (on PyTorch's current stream there) when
+    Kilosort runs on a device other than the current one, e.g. cuda:1."""
+    for v in itertools.chain(args, kwargs.values()):
+        if torch.is_tensor(v) and v.is_cuda:
+            import cupy as cp
+            index = v.device.index
+            with torch.cuda.device(index), cp.cuda.Device(index):
+                return fused(*args, **kwargs)
+    return fused(*args, **kwargs)
+
+
 def verified_call(key, reference, fused, *args, **kwargs):
     """Call `fused` instead of `reference` once it has been checked.
 
@@ -113,7 +128,7 @@ def verified_call(key, reference, fused, *args, **kwargs):
     if state['use_fused'] is None:
         ref = reference(*args, **kwargs)
         try:
-            new = fused(*args, **kwargs)
+            new = _on_device(fused, args, kwargs)
         except ValueError as e:
             # unsupported shape / dtype for this fused kernel
             state['use_fused'] = False
@@ -148,7 +163,7 @@ def verified_call(key, reference, fused, *args, **kwargs):
         return ref
     if state['use_fused']:
         try:
-            return fused(*args, **kwargs)
+            return _on_device(fused, args, kwargs)
         except ValueError as e:
             # unsupported shape for this fused kernel: use the reference
             state['use_fused'] = False
@@ -174,7 +189,8 @@ def _function(src_name, name, defines=()):
     can be compile-time constants (one module per distinct set of values).
     """
     import cupy as cp
-    key = (src_name, tuple(defines))
+    # Modules are loaded on the current device, so keep one per device.
+    key = (src_name, tuple(defines), cp.cuda.Device().id)
     if key not in _modules:
         options = ('--fmad=false',) + tuple(f'-D{k}={v}' for k, v in defines)
         _modules[key] = cp.RawModule(code=_SOURCES[src_name], options=options)
