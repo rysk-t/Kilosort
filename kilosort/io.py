@@ -1156,10 +1156,11 @@ class BinaryFiltered(BinaryRWFile):
         The default filter is the circular correlation
         y[n] = sum_j h[c+j] x[(n + j + o) mod NT] (c: center of the impulse
         response h, o: offset from the zero padding and fftshift). h decays
-        below float32 resolution within a few hundred samples, so it is
-        truncated to |j| <= E and X is extended circularly by E samples on
-        each side, after which a linear correlation of length >= NT + 2E
-        gives the same result up to rounding (|truncated tail| < 1e-12).
+        quickly (within ~1000 samples for a 300 Hz cutoff at 30 kHz, longer
+        for lower cutoffs), so it is truncated to |j| <= E, at least the
+        smallest E that keeps all but 1e-10 of sum |h|, and X is extended
+        circularly by E samples on each side, after which a linear
+        correlation of length >= NT + 2E gives the same result up to rounding.
         """
         NT = X.shape[1]
         cached = self.__dict__.get('_fwav_circ')
@@ -1167,12 +1168,21 @@ class BinaryFiltered(BinaryRWFile):
             h = self.hp_filter
             ft = h.shape[0]
             c = ft // 2
-            if ft < NT:
-                o = (NT - ft) // 2 + c - NT // 2
-            else:
-                o = c - (ft - NT) // 2 - NT // 2 if ft > NT else c - NT // 2
-            N = _fast_fft_length(NT + 2 * 800)
-            E = min((N - NT) // 2, c, ft - 1 - c)
+            # The part of h the default filter uses: all of it, or its
+            # central NT samples if it is longer than the batch.
+            lo = (ft - NT) // 2 if ft > NT else 0
+            hi = lo + NT if ft > NT else ft
+            o = (NT - ft) // 2 + c - NT // 2 if ft < NT else c - lo - NT // 2
+            a = h[lo:hi].abs().double().cpu().numpy()
+            cc = c - lo
+            emax = min(cc, len(a) - 1 - cc)
+            # kept[e] = sum of |h[c+j]| over |j| <= e
+            kept = (np.cumsum(a[cc:cc+emax+1])
+                    + np.concatenate(([0.0], np.cumsum(a[cc-1::-1][:emax]))))
+            enough = kept >= a.sum() * (1 - 1e-10)
+            Emin = int(np.argmax(enough)) if enough.any() else emax
+            N = _fast_fft_length(NT + 2 * Emin)
+            E = min((N - NT) // 2, emax)
             g = torch.zeros(N, device=h.device)
             g[:E+1] = h[c:c+E+1]
             g[N-E:] = h[c-E:c]
