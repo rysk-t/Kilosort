@@ -1,5 +1,6 @@
 import gc
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 
@@ -14,9 +15,12 @@ import faiss
 from tqdm import tqdm 
 
 from kilosort import hierarchical, swarmsplitter
-from kilosort.utils import log_performance
+from kilosort.utils import log_performance, fastest
 
 logger = logging.getLogger(__name__)
+
+# Time the last `run` spent waiting for the prefetch thread (for profiling).
+run_stats = {'prefetch_wait': 0.0}
 
 
 def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
@@ -58,6 +62,46 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     rows = np.tile(np.arange(n_samples)[:, np.newaxis], (1, n_neigh)).flatten()
     M   = csr_matrix((dexp.flatten(), (rows, kn.flatten())),  # (data, (row,col))
                      (kn.shape[0], n_nodes))                  # (shape)
+
+    # self connections are set to 0
+    skip_idx = np.arange(0, n_samples, nskip)
+    if rev_idx is not None:
+        skip_idx = skip_idx[rev_idx]
+    M[skip_idx, np.arange(n_nodes)] = 0
+
+    return kn, M
+
+
+def neigh_mat_gpu(Xg, nskip=1, n_neigh=10, max_sub=25000):
+    """`neigh_mat` with the exact neighbor search done on the GPU.
+
+    Same subset and graph as `neigh_mat`, but the distances are computed with
+    torch (|y|^2 - 2 x.y, chunked over spikes) instead of faiss on the CPU,
+    so ties and the last bits of the distances may differ. Returns `kn` as a
+    tensor on the device of `Xg`.
+    """
+    n_samples = Xg.shape[0]
+    sub = np.arange(0, n_samples, nskip)
+    n1 = sub.size
+    if (max_sub is not None) and (n1 > max_sub):
+        idx, rev_idx = subsample_idx(n1, n1 - max_sub)
+        sub = sub[idx]
+    else:
+        rev_idx = None
+    n_nodes = sub.size
+    Xsub = Xg[torch.from_numpy(sub).to(Xg.device)]
+    sq = (Xsub**2).sum(1)
+    # About 256 MiB of distances per chunk.
+    chunk = max(1, min(n_samples, 2**26 // max(n_nodes, 1)))
+    kn = torch.empty((n_samples, n_neigh), dtype=torch.int64, device=Xg.device)
+    for s in range(0, n_samples, chunk):
+        d = torch.addmm(sq.unsqueeze(0), Xg[s:s+chunk], Xsub.T, alpha=-2)
+        kn[s:s+chunk] = torch.topk(d, n_neigh, dim=1, largest=False).indices
+
+    kn_np = kn.cpu().numpy()
+    dexp = np.ones(kn_np.size, np.float32)
+    rows = np.repeat(np.arange(n_samples), n_neigh)
+    M = csr_matrix((dexp, (rows, kn_np.ravel())), (n_samples, n_nodes))
 
     # self connections are set to 0
     skip_idx = np.arange(0, n_samples, nskip)
@@ -205,8 +249,9 @@ def _release_graph_pool(device, *, empty_cache=False):
 
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
             nclust=200, seed=1, niter=200, lam=0, device=torch.device('cuda'),
-            verbose=False, M=None):
-    # kn and M from neigh_mat can be passed in together (see `run`).
+            verbose=False, M=None, Xg=None):
+    # kn and M from neigh_mat can be passed in together (see `run`), and Xg
+    # (Xd already on `device`) to avoid a second copy.
 
     if kn is None:
         # kn: n_spikes by n_neigh with integer indices into the spike subset
@@ -220,8 +265,9 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
         logger.debug(f'kj: {kj.nbytes / (2**20):.2f} MB, shape: {kj.shape}')
         log_performance(logger, header='clustering_qr.cluster, after Mstats')
 
-    Xg = Xd.to(device)
-    kn = torch.from_numpy(kn).to(device)
+    if Xg is None:
+        Xg = Xd.to(device)
+    kn = kn.to(device) if torch.is_tensor(kn) else torch.from_numpy(kn).to(device)
     n_spikes, n_neigh = kn.shape
     nsub = M.shape[1]  # number of spikes in neighbor-finding subset
 
@@ -558,6 +604,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     ycent = y_centers(ops)
     xcent = x_centers(ops)
     nsp = st.shape[0]
+    run_stats['prefetch_wait'] = 0.0
     nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
     total_centers = np.unique(nearest_center).size
 
@@ -569,6 +616,9 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                if kk + jj*ycent.size in nearest_center]
     iC_cpu = iC.cpu() if torch.is_tensor(iC) else iC
     template_groups = _template_groups(iclust_template)
+    # The neighbor search runs on the GPU in the main thread instead (much
+    # faster than faiss for the large centers of long recordings).
+    knn_gpu = torch.device(device).type == 'cuda' and fastest('knn')
 
     def prepare_center(jj, kk):
         ix = (nearest_center == kk + jj*ycent.size)
@@ -577,7 +627,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
             dmin=dmin, dminx=dminx, ix=ix, _groups=template_groups,
             )
         kn = M = None
-        if Xd is not None and Xd.shape[0] >= 1000:
+        if Xd is not None and Xd.shape[0] >= 1000 and not knn_gpu:
             kn, M = neigh_mat(Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub)
         return ix, Xd, igood, ichan, kn, M
 
@@ -611,7 +661,9 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     t += 1
                 # Start preparing the next center, then collect this one.
                 submit(ci + 1)
+                tw = time.perf_counter()
                 ix, Xd, igood, ichan, kn, M = futures.pop(ci).result()
+                run_stats['prefetch_wait'] += time.perf_counter() - tw
                 ci += 1
                 ntemp = ix.sum()
 
@@ -642,12 +694,19 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     else:
                         st0 = None
 
+                    Xg = None
+                    if knn_gpu:
+                        Xg = Xd.to(device)
+                        kn, M = neigh_mat_gpu(Xg, nskip=nskip, n_neigh=n_neigh,
+                                              max_sub=max_sub)
+
                     # find new clusters
                     iclust, iclust0, M, _ = cluster(
                         Xd, kn=kn, M=M, nskip=nskip, n_neigh=n_neigh,
                         max_sub=max_sub, lam=1, seed=seed, device=device,
-                        verbose=v
+                        verbose=v, Xg=Xg
                         )
+                    del Xg
 
                     if clear_cache:
                         if v:
@@ -677,9 +736,18 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
 
                 # we need the new templates here         
                 W = torch.zeros((Nfilt, ops['Nchan'], ops['settings']['n_pcs']))
-                for j in range(Nfilt):
-                    w = Xd[iclust==j].mean(0)
-                    W[j, ichan, :] = torch.reshape(w, (-1, ops['settings']['n_pcs'])).cpu()
+                if fastest('wmean'):
+                    # All cluster means in one pass over Xd (sum / count).
+                    lab = torch.as_tensor(np.asarray(iclust)).long()
+                    wsum = torch.zeros((Nfilt, Xd.shape[1]), dtype=Xd.dtype)
+                    wsum.index_add_(0, lab, Xd)
+                    cnt = torch.bincount(lab, minlength=Nfilt).to(Xd.dtype)
+                    w = wsum / cnt.unsqueeze(1)
+                    W[:, ichan, :] = w.reshape(Nfilt, -1, ops['settings']['n_pcs'])
+                else:
+                    for j in range(Nfilt):
+                        w = Xd[iclust==j].mean(0)
+                        W[j, ichan, :] = torch.reshape(w, (-1, ops['settings']['n_pcs'])).cpu()
                 
                 Wall = torch.cat((Wall, W), 0)
 
@@ -704,6 +772,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
         # graph is gone, including on WDDM where allocations can spill.
         _release_graph_pool(device, empty_cache=True)
 
+    logger.debug(f"clustering_qr.run: main thread waited {run_stats['prefetch_wait']:.2f} s for prefetch")
     if nearby_chans_empty == total_centers:
         raise ValueError(
             f'`get_data_cpu` never found suitable channels in `clustering_qr.run`.'

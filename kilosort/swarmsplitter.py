@@ -8,6 +8,14 @@ def count_elements(kk, iclust, my_clus, xtree):
     n2 = np.isin(iclust, my_clus[xtree[kk, 1]]).sum()
     return n1, n2
 
+def _members(iclust, labels, nlab):
+    """Same as np.isin(iclust, labels) for labels in [0, nlab), with a
+    lookup table instead of sorting."""
+    lut = np.zeros(max(nlab, max(labels) + 1), bool)
+    lut[labels] = True
+    return lut[iclust]
+
+
 def check_split(Xd, kk, xtree, iclust, my_clus, ix1=None, ix2=None):
     if ix1 is None or ix2 is None:
         ixy = np.isin(iclust, my_clus[xtree[kk, 2]])
@@ -97,6 +105,7 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
     kk = xtree.shape[0]-1
     nc = xtree.shape[0] + 1
     valid_merge = np.ones((nc-1,), 'bool')
+    nlab = int(iclust.max()) + 1 if iclust.size else 0
 
 
     for kk in range(nc-2,-1,-1):
@@ -108,8 +117,8 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
         if tstat[kk,0] < 0.2:
             continue
 
-        ix1 = np.isin(iclust, my_clus[xtree[kk, 0]])
-        ix2 = np.isin(iclust, my_clus[xtree[kk, 1]])
+        ix1 = _members(iclust, my_clus[xtree[kk, 0]], nlab)
+        ix2 = _members(iclust, my_clus[xtree[kk, 1]], nlab)
 
         criterion = 0
         score = np.nan
@@ -155,8 +164,9 @@ def new_clusters(iclust, my_clus, xtree, tstat):
 
     ind = np.nonzero(isleaf)[0]
     iclust1 = iclust.copy()
+    nlab = int(iclust.max()) + 1 if iclust.size else 0
     for j in range(len(ind)):
-        ix = np.isin(iclust, my_clus[ind[j]])
+        ix = _members(iclust, my_clus[ind[j]], nlab)
         iclust1[ix] = j
         xtree[xtree[:,0] == ind[j], 0] = j
         xtree[xtree[:,1] == ind[j], 1] = j

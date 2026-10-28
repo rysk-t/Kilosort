@@ -5,6 +5,8 @@ from torch.nn.functional import conv1d
 import math 
 from tqdm import trange 
 
+from kilosort.utils import fastest
+
 @njit(cache=True)
 def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500):
 
@@ -94,12 +96,28 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, acg_threshold=0.2,
 def similarity(Wall, W, nt=61):
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
     WtW = torch.flip(WtW, [2,])
+    if W.device.type == 'cuda' and fastest('simgpu'):
+        return _similarity_device(Wall.to(W.device), WtW)
     mu = (Wall**2).sum((1,2), keepdims=True)**.5
     Wnorm = Wall / (1e-6 + mu)
     UtU = torch.einsum('ilk, jlm -> ijkm',  Wnorm, Wnorm)
     similar_templates = torch.einsum('ijkm, kml -> ijl', UtU.cpu(), WtW.cpu()).numpy()
     similar_templates = similar_templates.max(axis=-1)
     return similar_templates
+
+def _similarity_device(Wall, WtW):
+    """`similarity` on the device of Wall, in chunks of templates (the
+    (n, n, nt) cross-correlations do not fit in memory for many units)."""
+    mu = (Wall**2).sum((1,2), keepdims=True)**.5
+    Wnorm = Wall / (1e-6 + mu)
+    n, nl = Wall.shape[0], WtW.shape[-1]
+    chunk = max(1, 2**26 // max(1, n * nl))
+    out = torch.empty((n, n), device=Wall.device)
+    for s in range(0, n, chunk):
+        UtU = torch.einsum('ilk, jlm -> ijkm', Wnorm[s:s+chunk], Wnorm)
+        out[s:s+chunk] = torch.einsum('ijkm, kml -> ijl', UtU, WtW).amax(-1)
+    return out.cpu().numpy()
+
 
 def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
     

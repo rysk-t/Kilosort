@@ -33,6 +33,14 @@ PROBE_URLS = {
 }
 
 
+def fastest(feature):
+    """True unless `feature` is listed in the KS_FASTEST_OFF environment
+    variable (comma separated). The speed-only changes of this branch, which
+    do not reproduce upstream bit for bit, can be switched off one by one."""
+    off = os.environ.get('KS_FASTEST_OFF', '')
+    return feature not in {f.strip() for f in off.split(',')}
+
+
 def template_path(basename='wTEMP.npz'):
     """ currently only one set of example templates to use"""
     return cache_template_path(basename)
