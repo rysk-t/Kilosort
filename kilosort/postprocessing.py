@@ -6,7 +6,7 @@ import torch
 from kilosort.clustering_qr import xy_templates, get_data_cpu
 
 
-@njit("(int64[:], int32[:], int32)")
+@njit("(int64[:], int32[:], int32)", cache=True)
 def remove_duplicates(spike_times, spike_clusters, dt=15):
     '''Removes same-cluster spikes that occur within `dt` samples.'''
     keep = np.zeros_like(spike_times, bool_)
@@ -97,21 +97,38 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
 
     # xy: template centers, iC: channels associated with each template
     xy, iC = xy_templates(ops)
+    # Feature construction runs on the CPU. Copy these integer indices once
+    # instead of using a GPU tensor in every cluster's channel mapping.
+    if torch.is_tensor(iC):
+        iC = iC.cpu()
     n_templates = iC.shape[1]
     n_clusters = np.unique(spike_clusters).size
     n_chans = ops['nearest_chans']
     feature_ind = np.zeros((n_clusters, n_chans), dtype=np.uint32)
 
-    for i in np.unique(spike_clusters):
+    # Group spikes by cluster once instead of scanning all spikes per cluster.
+    clusters = np.unique(spike_clusters)
+    corder = np.argsort(spike_clusters, kind='stable')
+    csorted = spike_clusters[corder]
+    starts = np.searchsorted(csorted, clusters, side='left')
+    ends = np.searchsorted(csorted, clusters, side='right')
+
+    for i, cs, ce in zip(clusters, starts, ends):
+        # Only this cluster's spikes are read and overwritten. Spikes detected
+        # with one template are often split across several final clusters, so
+        # selecting spikes by template would rank channels on other clusters'
+        # spikes and re-read rows that an earlier cluster already reordered.
+        isp = torch.from_numpy(corder[cs:ce])
+        pid = spike_templates[isp.numpy()]
         # Get templates associated with cluster (often just 1)
-        iunq = np.unique(spike_templates[spike_clusters==i]).astype(int)
+        iunq = np.unique(pid).astype(int)
         # Get boolean mask with size (n_templates,), True if they match cluster
         ix = torch.from_numpy(np.zeros(n_templates, bool))
         ix[iunq] = True
-        # Get PC features for all spikes detected with those templates (Xd),
-        # and the indices in tF where those spikes occur (igood).
+        # Get PC features for the cluster's spikes (Xd), and the indices
+        # of those spikes within isp (igood).
         Xd, igood, ichan = get_data_cpu(
-            ops, xy, iC, spike_templates, tF, None, None,
+            ops, xy, iC, pid, tF[isp], None, None,
             dmin=ops['dmin'], dminx=ops['dminx'], ix=ix, merge_dim=False
             )
 
@@ -120,7 +137,7 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
         chan_norm = torch.linalg.norm(spike_mean, dim=1)
         sorted_chans, ind = torch.sort(chan_norm, descending=True)
         # Assign features to overwrite tF in-place
-        tF[igood,:] = Xd[:, ind[:n_chans], :]
+        tF[isp[igood],:] = Xd[:, ind[:n_chans], :]
         # Save channel inds for phy
         feature_ind[i,:] = ichan[ind[:n_chans]].cpu().numpy()
 
