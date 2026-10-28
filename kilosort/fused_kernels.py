@@ -717,6 +717,94 @@ void cfmax_dirty_kernel(ptr_t pB, ptr_t pnm, ptr_t pCf, ptr_t pim, ptr_t pst,
     cf_column((const float*)pB, (const float*)pnm, (float*)pCf, (long long*)pim, NU, NT, nt, t);
 }
 
+// Grouped version (fastest branch): gmax / gidx hold, for every group of GS
+// consecutive templates and every column, the max of Cf over the group and
+// its first index. A peel only changes the rows of B in the groups that its
+// spikes' templates touch, so only those are recomputed, and Cfmax / imax are
+// the max over the groups (strictly greater wins, groups in index order),
+// which is the same value and index as the scan over all templates.
+__device__ __forceinline__
+void group_column(const float* B, const float* nm, float* gmax, int* gidx,
+                  int NU, int NT, int nt, int g, int t)
+{
+    float best = 0.0f;
+    int bi = g * GS;
+    if (t >= nt && t < NT - nt) {
+        int i0 = g * GS, i1 = min(i0 + GS, NU);
+        float r = B[(long long)i0 * NT + t];
+        r = r < 0.0f ? 0.0f : r;
+        best = (r * r) / nm[i0];
+        for (int i = i0 + 1; i < i1; ++i) {
+            float v = B[(long long)i * NT + t];
+            v = v < 0.0f ? 0.0f : v;
+            float c = (v * v) / nm[i];
+            if (c > best) { best = c; bi = i; }
+        }
+    }
+    gmax[(long long)g * NT + t] = best;
+    gidx[(long long)g * NT + t] = bi;
+}
+
+__device__ __forceinline__
+void combine_column(const float* gmax, const int* gidx, float* Cfmax, long long* imax,
+                    int G, int NT, int nt, int t)
+{
+    float best = 0.0f;
+    long long bi = 0;
+    if (t >= nt && t < NT - nt) {
+        best = gmax[t];
+        bi = gidx[t];
+        for (int g = 1; g < G; ++g) {
+            float v = gmax[(long long)g * NT + t];
+            if (v > best) { best = v; bi = gidx[(long long)g * NT + t]; }
+        }
+    }
+    Cfmax[t] = best;
+    imax[t] = bi;
+}
+
+extern "C" __global__
+void gmax_kernel(ptr_t pB, ptr_t pnm, ptr_t pgm, ptr_t pgi, int NU, int NT, int nt)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= NT) return;
+    group_column((const float*)pB, (const float*)pnm, (float*)pgm, (int*)pgi, NU, NT, nt,
+                 blockIdx.y, t);
+}
+
+// Groups g0[y] + blockIdx.y <= g1[y] of the template y of spike k0 + blockIdx.x,
+// columns x - nt .. x + nt.
+extern "C" __global__
+void gmax_dirty_kernel(ptr_t pB, ptr_t pnm, ptr_t pgm, ptr_t pgi, ptr_t pst,
+                       ptr_t pg0, ptr_t pg1, int k0, int NU, int NT, int nt)
+{
+    const long long* st = (const long long*)pst;
+    long long s = (long long)(k0 + blockIdx.x) * 2;
+    int t = (int)st[s] + (int)threadIdx.x - nt;
+    int y = (int)st[s + 1];
+    int g = ((const int*)pg0)[y] + blockIdx.y;
+    if (threadIdx.x > 2 * nt || t < 0 || t >= NT || g > ((const int*)pg1)[y]) return;
+    group_column((const float*)pB, (const float*)pnm, (float*)pgm, (int*)pgi, NU, NT, nt, g, t);
+}
+
+extern "C" __global__
+void combine_kernel(ptr_t pgm, ptr_t pgi, ptr_t pCf, ptr_t pim, int G, int NT, int nt)
+{
+    int t = blockIdx.x * blockDim.x + threadIdx.x;
+    if (t >= NT) return;
+    combine_column((const float*)pgm, (const int*)pgi, (float*)pCf, (long long*)pim, G, NT, nt, t);
+}
+
+extern "C" __global__
+void combine_dirty_kernel(ptr_t pgm, ptr_t pgi, ptr_t pCf, ptr_t pim, ptr_t pst,
+                          int k0, int G, int NT, int nt)
+{
+    const long long* st = (const long long*)pst;
+    int t = (int)st[(long long)(k0 + blockIdx.x) * 2] + (int)threadIdx.x - nt;
+    if (threadIdx.x > 2 * nt || t < 0 || t >= NT) return;
+    combine_column((const float*)pgm, (const int*)pgi, (float*)pCf, (long long*)pim, G, NT, nt, t);
+}
+
 // Cmax = max_pool1d(Cfmax, 2*nt+1); mask = (Cmax > Th**2) & (|Cmax - Cfmax| < 1e-9)
 __device__ __forceinline__
 void pool_column(const float* Cfmax, float* Cmax, bool* mask, int NT, int nt, float th2,
@@ -921,7 +1009,40 @@ void upd2_kernel(ptr_t pst, ptr_t pB, ptr_t pX, ptr_t ptB, ptr_t ptX,
 """
 
 _CTPB = 1024
+_RM_GS = 32
 _sparsity_cache = {}
+_groups_cache = {}
+
+
+def _fastest(feature):
+    from kilosort.utils import fastest
+    return fastest(feature)
+
+
+def _template_groups_rm(U, ctc, rows, row0, GS):
+    """For each template y, the first and last group of GS rows that contain
+    a row of B changed by y's spikes (the nonzero rows of ctc[:, y]), cached
+    like _template_sparsity. Returns (g0, g1) as int32 CUDA tensors and the
+    largest number of groups of one template."""
+    hit = _groups_cache.get('hit')
+    if hit is not None and hit[0]() is U and hit[1]() is ctc and hit[2] == GS:
+        return hit[3]
+    r = rows.long().cpu().numpy()
+    o = row0.long().cpu().numpy()
+    NU = len(o) - 1
+    g0 = np.zeros(NU, np.int32)
+    g1 = np.zeros(NU, np.int32)
+    for y in range(NU):
+        ry = r[o[y]:o[y+1]]
+        if len(ry):
+            g0[y], g1[y] = ry.min() // GS, ry.max() // GS
+        else:
+            g0[y], g1[y] = 0, -1
+    span = int((g1 - g0).max()) + 1 if NU else 1
+    payload = (torch.from_numpy(g0).to(rows.device), torch.from_numpy(g1).to(rows.device),
+               max(span, 1))
+    _groups_cache['hit'] = (weakref.ref(U), weakref.ref(ctc), GS, payload)
+    return payload
 
 
 def _csr(nz):
@@ -1013,7 +1134,17 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     nwB, nwX = 2*nt + 1, 2*(nt//2) + 1
     tpb_upd = (max(nwB, nwX) + 31) // 32 * 32
 
-    consts = (('CTPB', _CTPB),)
+    consts = (('CTPB', _CTPB), ('GS', _RM_GS))
+    grouped = _fastest('rm_groups')
+    if grouped:
+        G = (NU + _RM_GS - 1) // _RM_GS
+        g0, g1, gspan = _template_groups_rm(U, ctc, rows, row0, _RM_GS)
+        gmax = torch.empty((G, NT), device=device)
+        gidx = torch.empty((G, NT), dtype=torch.int32, device=device)
+        k_gmax = _function('run_matching', 'gmax_kernel', consts)
+        k_gmax_dirty = _function('run_matching', 'gmax_dirty_kernel', consts)
+        k_comb = _function('run_matching', 'combine_kernel', consts)
+        k_comb_dirty = _function('run_matching', 'combine_dirty_kernel', consts)
     cfmax = _function('run_matching', 'cfmax_kernel', consts)
     cfmax_dirty = _function('run_matching', 'cfmax_dirty_kernel', consts)
     pool = _function('run_matching', 'pool_kernel', consts)
@@ -1029,7 +1160,18 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
             # when there are many spikes their (overlapping) windows cover
             # more columns than the full pass, which is then cheaper. Both
             # paths use the same per-column device functions.
-            if t == 0 or nsp * nwB >= NT:
+            if grouped:
+                if t == 0:
+                    k_gmax((gridT[0], G), (tpb,), (_p(B), _p(nm), _p(gmax), _p(gidx), *_i32(NU, NT, nt)))
+                else:
+                    k_gmax_dirty((nsp, gspan), (nwB,), (_p(B), _p(nm), _p(gmax), _p(gidx), _p(st),
+                                                        _p(g0), _p(g1), *_i32(k - nsp, NU, NT, nt)))
+                if t == 0 or nsp * nwB >= NT:
+                    k_comb(gridT, (tpb,), (_p(gmax), _p(gidx), _p(Cfmax), _p(imax), *_i32(G, NT, nt)))
+                else:
+                    k_comb_dirty((nsp,), (nwB,), (_p(gmax), _p(gidx), _p(Cfmax), _p(imax), _p(st),
+                                                  *_i32(k - nsp, G, NT, nt)))
+            elif t == 0 or nsp * nwB >= NT:
                 cfmax(gridT, (tpb,), (_p(B), _p(nm), _p(Cfmax), _p(imax), *_i32(NU, NT, nt)))
             else:
                 cfmax_dirty((nsp,), (nwB,), (_p(B), _p(nm), _p(Cfmax), _p(imax), _p(st),
