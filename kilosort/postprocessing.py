@@ -4,6 +4,7 @@ import numpy as np
 import torch
 
 from kilosort.clustering_qr import xy_templates, get_data_cpu, _template_groups
+from kilosort.utils import stable_argsort
 
 
 @njit("(int64[:], int32[:], int32)", cache=True)
@@ -108,7 +109,7 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
 
     # Group spikes by cluster once instead of scanning all spikes per cluster.
     clusters = np.unique(spike_clusters)
-    corder = np.argsort(spike_clusters, kind='stable')
+    corder = stable_argsort(spike_clusters)
     csorted = spike_clusters[corder]
     starts = np.searchsorted(csorted, clusters, side='left')
     ends = np.searchsorted(csorted, clusters, side='right')

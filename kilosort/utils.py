@@ -41,6 +41,17 @@ def fastest(feature):
     return feature not in {f.strip() for f in off.split(',')}
 
 
+def stable_argsort(a):
+    """np.argsort(a, kind='stable'), on the GPU for large integer arrays
+    (a stable sort has only one answer, so the result is the same)."""
+    a = np.asarray(a)
+    if (a.size > 2**20 and a.dtype.kind in 'iu' and torch.cuda.is_available()
+            and fastest('gpu_argsort')):
+        t = torch.from_numpy(np.ascontiguousarray(a)).cuda()
+        return torch.sort(t, stable=True).indices.cpu().numpy()
+    return np.argsort(a, kind='stable')
+
+
 def template_path(basename='wTEMP.npz'):
     """ currently only one set of example templates to use"""
     return cache_template_path(basename)

@@ -15,7 +15,7 @@ import faiss
 from tqdm import tqdm 
 
 from kilosort import fused_kernels, hierarchical, swarmsplitter
-from kilosort.utils import log_performance, fastest
+from kilosort.utils import log_performance, fastest, stable_argsort
 
 logger = logging.getLogger(__name__)
 
@@ -889,7 +889,7 @@ def _template_groups(PID):
     if torch.is_tensor(PID):
         PID = PID.detach().cpu().numpy()
     nvals = int(PID.max()) + 1 if PID.size else 0
-    order = np.argsort(PID, kind='stable')
+    order = stable_argsort(PID)
     bounds = np.searchsorted(PID[order], np.arange(nvals + 1))
     return order, bounds
 

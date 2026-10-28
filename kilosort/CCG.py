@@ -8,7 +8,7 @@ from torch.nn.functional import conv1d
 import math 
 from tqdm import trange 
 
-from kilosort.utils import fastest
+from kilosort.utils import fastest, stable_argsort
 
 @njit(cache=True, nogil=True)
 def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500):
@@ -132,7 +132,7 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
 
     # Group spike indices by cluster once (stable sort keeps each cluster's
     # spikes in their original order) instead of scanning iclust2 per cluster.
-    order = np.argsort(iclust2, kind='stable')
+    order = stable_argsort(iclust2)
     bounds = np.searchsorted(iclust2[order], np.arange(Nfilt + 1))
 
     def one(kk):

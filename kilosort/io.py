@@ -19,7 +19,7 @@ from kilosort.preprocessing import get_drift_matrix, fft_highpass
 from kilosort.postprocessing import (
     remove_duplicates, compute_spike_positions, make_pc_features
     )
-from kilosort.utils import log_performance
+from kilosort.utils import log_performance, fastest
 
 _torch_warning = ".*PyTorch does not support non-writable tensors"
 _prefetch_executor = None
@@ -276,6 +276,23 @@ def select_shank(probe, shank_idx):
     return probe
 
 
+def _save_mapped(path, arr):
+    """np.save through a memory-mapped .npy file (same file contents).
+
+    The copy goes to the page cache and Windows writes it back lazily,
+    instead of np.save's buffered writes of a strided array, which wait for
+    the disk (~20 s for the 3 GB pc_features of a 45 min Neuropixels run).
+    """
+    if torch.is_tensor(arr):
+        arr = arr.numpy()
+    path = Path(path)
+    if path.exists():
+        path.unlink()
+    m = np.lib.format.open_memmap(path, mode='w+', dtype=arr.dtype, shape=arr.shape)
+    m[...] = arr
+    del m
+
+
 def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
                 data_dtype=None, save_extra_vars=False,
                 save_preprocessed_copy=False, skip_dat_path=False,
@@ -443,7 +460,10 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     pc_features, pc_feature_ind = make_pc_features(
         ops, spike_templates, spike_clusters, tF
         )
-    np.save(results_dir / 'pc_features.npy', pc_features)
+    if fastest('mmap_save'):
+        _save_mapped(results_dir / 'pc_features.npy', pc_features)
+    else:
+        np.save(results_dir / 'pc_features.npy', pc_features)
     np.save(results_dir / 'pc_feature_ind.npy', pc_feature_ind)
     log_performance(logger, level='debug', header='save_to_phy, pc features',
                     reset=True)

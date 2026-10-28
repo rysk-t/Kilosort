@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from kilosort import CCG, fused_kernels
 from kilosort.spikedetect import grow_buffer
-from kilosort.utils import log_performance
+from kilosort.utils import log_performance, stable_argsort
 
 logger = logging.getLogger(__name__)
 
@@ -287,7 +287,7 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     # Spike indices of each cluster (ascending), kept up to date as clusters
     # merge, so each lookup doesn't need a scan over all spikes (clu2 == kk).
     nvals = max(NN, int(clu2.max()) + 1) if clu2.size else NN
-    order = np.argsort(clu2, kind='stable')
+    order = stable_argsort(clu2)
     bounds = np.searchsorted(clu2[order], np.arange(nvals + 1))
     members = [order[bounds[k]:bounds[k+1]] for k in range(nvals)]
 
