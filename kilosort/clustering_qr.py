@@ -146,6 +146,21 @@ def _assign_kernel_ok():
     return _assign_kernel_state['ok']
 
 
+def _kpp_kernel_ok():
+    """Whether the CuPy kernel for kmeans_plusplus can be used."""
+    if 'kpp' not in _assign_kernel_state:
+        ok = fused_kernels.enabled()
+        if ok:
+            try:
+                fused_kernels._function('kpp', 'kpp_vsum_kernel',
+                                        (('ROWS', fused_kernels._KPP_ROWS),))
+            except Exception as e:
+                logger.info(f'kmeans_plusplus kernel unavailable ({e!r}); using PyTorch.')
+                ok = False
+        _assign_kernel_state['kpp'] = ok
+    return _assign_kernel_state['kpp']
+
+
 def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
     """Same result as the dense `assign_iclust` for lam > 0, without the
     (n_spikes, nclust) score matrix.
@@ -437,6 +452,11 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     # The iteration number is kept on the GPU (jt) and all state is updated
     # in place, so that one iteration can be replayed from a CUDA graph.
     jt = torch.zeros((), dtype=torch.int, device=device)
+    # Fused column sums (CuPy) instead of the (n_spikes, ntry) temporaries;
+    # 2 * Xg is computed once (the same values as in every iteration).
+    fused = Xg.is_cuda and fastest('kpp_kernel') and _kpp_kernel_ok()
+    if fused:
+        Xg2 = 2 * Xg
 
     def step():
         # v2 is the un-explained variance so far for each spike
@@ -452,6 +472,18 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
 
         # The new centroids to be tested, sampled from the spikes in Xg.
         Xc = Xg[isamp]
+        if fused:
+            P = Xg2 @ Xc.T
+            csq = (Xc**2).sum(1)
+            vsum = fused_kernels.kpp_vsum(P, csq, vexp0)
+            imax = torch.argmax(vsum).view(1)
+            vcol = P.index_select(1, imax).squeeze(1) - csq.index_select(0, imax)
+            ix = torch.relu(vcol - vexp0) > 0
+            iclust.copy_(torch.where(ix, jt, iclust))
+            mu.index_copy_(0, jt.view(1).long(), Xc.index_select(0, imax))
+            vexp0.copy_(torch.where(ix, vcol, vexp0))
+            jt.add_(1)
+            return
         # Variance explained for each spike for the new centroids.
         vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
         # Difference between variance explained for new centroids

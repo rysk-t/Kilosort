@@ -1139,3 +1139,53 @@ def assign_iclust(isub, kn, kN, ki, top, coef):
         f(((n + tpb - 1) // tpb,), (tpb,),
           (_p(isub), _p(kn), _p(kN), _p(ki), _p(top), _p(out), np.int32(n), np.float32(coef)))
     return out
+
+
+# --------------------------------------------------------------------------
+# clustering_qr.kmeans_plusplus: explained variance gained by each candidate
+# --------------------------------------------------------------------------
+_SOURCES['kpp'] = r"""
+typedef unsigned long long ptr_t;
+// part[b, j] = sum over the rows i of block b of relu((P[i, j] - csq[j]) - v0[i]),
+// the rounding of each term as in relu(vexp - vexp0) with vexp = P - csq.
+// One thread per column j (NTRY <= blockDim.x), ROWS rows per block, so the
+// partial sums are deterministic.
+extern "C" __global__
+void kpp_vsum_kernel(ptr_t pP, ptr_t pcsq, ptr_t pv0, ptr_t ppart, int n, int ntry)
+{
+    const float* P = (const float*)pP;
+    const float* csq = (const float*)pcsq;
+    const float* v0 = (const float*)pv0;
+    float* part = (float*)ppart;
+    const int j = threadIdx.x;
+    if (j >= ntry) return;
+    const float c = csq[j];
+    const long long r0 = (long long)blockIdx.x * ROWS;
+    const long long r1 = min(r0 + ROWS, (long long)n);
+    float acc = 0.0f;
+    for (long long i = r0; i < r1; ++i) {
+        float d = __fsub_rn(__fsub_rn(P[i * ntry + j], c), v0[i]);
+        acc = __fadd_rn(acc, d > 0.0f ? d : 0.0f);
+    }
+    part[(long long)blockIdx.x * ntry + j] = acc;
+}
+"""
+
+_KPP_ROWS = 64
+
+
+def kpp_vsum(P, csq, v0):
+    """sum(relu((P - csq) - v0[:, None]), 0) for kmeans_plusplus, without the
+    intermediate (n, ntry) arrays. Deterministic, but the order of the sum
+    differs from PyTorch's. Can be recorded in a CUDA graph once loaded."""
+    n, ntry = P.shape
+    if ntry > 1024 or not (P.dtype == csq.dtype == v0.dtype == torch.float32):
+        raise ValueError('unsupported shape or dtype for fused kpp_vsum')
+    P, csq, v0 = P.contiguous(), csq.contiguous(), v0.contiguous()
+    nb = (n + _KPP_ROWS - 1) // _KPP_ROWS
+    part = torch.empty((nb, ntry), device=P.device)
+    f = _function('kpp', 'kpp_vsum_kernel', (('ROWS', _KPP_ROWS),))
+    tpb = (ntry + 31) // 32 * 32
+    with _stream():
+        f((nb,), (tpb,), (_p(P), _p(csq), _p(v0), _p(part), np.int32(n), np.int32(ntry)))
+    return part.sum(0)
