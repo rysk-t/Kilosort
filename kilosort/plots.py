@@ -225,7 +225,8 @@ def _render_strip(fig, ax, points, colors, xy, k, n_strips, out, dpi):
 
 def _drift_scatter_strip(st0, tmin, k, n_strips, out):
     """Strip `k` of the drift scatter plot (the same png when put together)."""
-    fig, ax, points, colors, xy = _drift_scatter_figure(st0, tmin, corners_only=True)
+    corners = 'plot_corners' not in os.environ.get('KS_FASTEST_OFF', '').split(',')
+    fig, ax, points, colors, xy = _drift_scatter_figure(st0, tmin, corners_only=corners)
     _render_strip(fig, ax, points, colors, xy, k, n_strips, out, 300)
 
 
@@ -266,19 +267,22 @@ def _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out):
         points.set_facecolor(colors[keep])
     else:
         # Single-color scatters (one per palette entry, in 16 consecutive
-        # chunks of spikes so that later spikes still mostly end up on top):
-        # matplotlib then draws them with its fast marker path instead of one
-        # path per spike (~15 us each). Only the stacking of overlapping
-        # markers of different colors within a chunk differs from the plot
-        # drawn in spike order.
+        # chunks of all spikes so that later spikes still mostly end up on
+        # top): matplotlib then draws them with its fast marker path instead
+        # of one path per spike (~15 us each). Only the stacking of
+        # overlapping markers of different colors within a chunk differs
+        # from the plot drawn in spike order: there the gray of the units
+        # that are not refractory goes below the colors. The chunks don't
+        # depend on the strips, so neither does the image.
         bad_units = np.unique(clu)[is_refractory == 0]
         palette_idx = np.mod(np.arange(int(clu.max()) + 1), 9)
         palette_idx[bad_units] = 9
         pal = palette_idx[clu]
         points.remove()
-        idx = np.nonzero(keep)[0]
-        for chunk in np.array_split(idx, 16):
-            for g in range(10):
+        bounds = np.linspace(0, len(clu), 17).astype(int)
+        for i0, i1 in zip(bounds[:-1], bounds[1:]):
+            chunk = i0 + np.nonzero(keep[i0:i1])[0]
+            for g in (9,) + tuple(range(9)):
                 sel = chunk[pal[chunk] == g]
                 if sel.size:
                     ax.scatter(xy[sel, 0], xy[sel, 1], s=3, c=PROBE_PLOT_COLORS[g:g+1])
@@ -494,8 +498,10 @@ class BackgroundSpikePositions:
         from pathlib import Path
         results_dir = Path(results_dir)
         if n_strips is None:
+            many = (len(clu) > 3_000_000 and 'plot_strips12'
+                    not in os.environ.get('KS_FASTEST_OFF', '').split(','))
             n_strips = 1 if len(clu) < 300_000 else min(
-                12 if len(clu) > 3_000_000 else 6, os.cpu_count() or 1)
+                12 if many else 6, os.cpu_count() or 1)
         if n_strips <= 1:
             self._plots = _BackgroundPlots(
                 '_spike_positions_from_file',

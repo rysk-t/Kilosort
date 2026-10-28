@@ -90,12 +90,17 @@ def neigh_mat_gpu(Xg, nskip=1, n_neigh=10, max_sub=25000):
         rev_idx = None
     n_nodes = sub.size
     Xsub = Xg[torch.from_numpy(sub).to(Xg.device)]
+    # Distances are computed from data centered on the subset's mean, which
+    # leaves them unchanged but keeps |y|^2 - 2 x.y from losing precision to
+    # cancellation when the data are far from the origin.
+    mu = Xsub.mean(0)
+    Xsub = Xsub - mu
     sq = (Xsub**2).sum(1)
     # About 256 MiB of distances per chunk.
     chunk = max(1, min(n_samples, 2**26 // max(n_nodes, 1)))
     kn = torch.empty((n_samples, n_neigh), dtype=torch.int64, device=Xg.device)
     for s in range(0, n_samples, chunk):
-        d = torch.addmm(sq.unsqueeze(0), Xg[s:s+chunk], Xsub.T, alpha=-2)
+        d = torch.addmm(sq.unsqueeze(0), Xg[s:s+chunk] - mu, Xsub.T, alpha=-2)
         kn[s:s+chunk] = torch.topk(d, n_neigh, dim=1, largest=False).indices
 
     skip_idx = np.arange(0, n_samples, nskip)
@@ -131,36 +136,45 @@ def _counts(idx, n, like):
 _assign_kernel_state = {}
 
 
-def _assign_kernel_ok(t):
-    """Whether the CuPy kernel for assign_iclust can be used (CuPy present
-    and the kernel compiles). Checked once, outside of any graph capture."""
-    if 'ok' not in _assign_kernel_state:
+def _assign_kernel_ok(kn, isub, ki):
+    """Whether the CuPy kernel for assign_iclust can be used: CuPy present,
+    supported dtypes, and the kernel for this number of neighbors (K, a
+    compile-time constant) compiles on this device. Checked (and compiled)
+    outside of any graph capture, once per device and K."""
+    if not (kn.dtype == isub.dtype == torch.int64 and ki.dtype == torch.float32):
+        return False
+    K = kn.shape[1]
+    key = ('assign', kn.device, K)
+    if key not in _assign_kernel_state:
         ok = fused_kernels.enabled()
         if ok:
             try:
-                with fused_kernels._device(t):
-                    fused_kernels._function('assign', 'assign_iclust_kernel', (('K', 10),))
+                with fused_kernels._device(kn):
+                    fused_kernels._function('assign', 'assign_iclust_kernel', (('K', K),))
             except Exception as e:
                 logger.info(f'assign_iclust kernel unavailable ({e!r}); using PyTorch.')
                 ok = False
-        _assign_kernel_state['ok'] = ok
-    return _assign_kernel_state['ok']
+        _assign_kernel_state[key] = ok
+    return _assign_kernel_state[key]
 
 
-def _kpp_kernel_ok(t):
-    """Whether the CuPy kernel for kmeans_plusplus can be used."""
-    if 'kpp' not in _assign_kernel_state:
+def _kpp_kernel_ok(Xg, ntry):
+    """Whether the CuPy kernel for kmeans_plusplus can be used (as above)."""
+    if Xg.dtype != torch.float32 or ntry > 1024:
+        return False
+    key = ('kpp', Xg.device)
+    if key not in _assign_kernel_state:
         ok = fused_kernels.enabled()
         if ok:
             try:
-                with fused_kernels._device(t):
+                with fused_kernels._device(Xg):
                     fused_kernels._function('kpp', 'kpp_vsum_kernel',
                                             (('ROWS', fused_kernels._KPP_ROWS),))
             except Exception as e:
                 logger.info(f'kmeans_plusplus kernel unavailable ({e!r}); using PyTorch.')
                 ok = False
-        _assign_kernel_state['kpp'] = ok
-    return _assign_kernel_state['kpp']
+        _assign_kernel_state[key] = ok
+    return _assign_kernel_state[key]
 
 
 def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
@@ -175,7 +189,8 @@ def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
     """
     K = kn.shape[1]
     kN = _counts(isub, nclust, tones2)[0]
-    if kn.is_cuda and _assign_kernel_ok(kn) and fastest('assign_kernel'):
+    if (kn.is_cuda and kN.dtype == torch.float32 and _assign_kernel_ok(kn, isub, ki)
+            and fastest('assign_kernel')):
         top = torch.sort(kN, stable=True).indices[:K+1]
         return fused_kernels.assign_iclust(isub, kn, kN, ki, top, lam/m)
     L = isub[kn]                                   # (n_spikes, n_neigh)
@@ -456,7 +471,7 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     jt = torch.zeros((), dtype=torch.int, device=device)
     # Fused column sums (CuPy) instead of the (n_spikes, ntry) temporaries;
     # 2 * Xg is computed once (the same values as in every iteration).
-    fused = Xg.is_cuda and fastest('kpp_kernel') and _kpp_kernel_ok(Xg)
+    fused = Xg.is_cuda and fastest('kpp_kernel') and _kpp_kernel_ok(Xg, ntry)
     if fused:
         Xg2 = 2 * Xg
 
@@ -936,7 +951,11 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
     nchan = ichan.nelement()
 
     dd = torch.zeros((nspikes, nchan, nfeatures))
-    if fastest('getdata'):
+    # A channel listed twice for one template (not the case for channel
+    # maps from Kilosort's own iC) is written twice; keep the original
+    # per-template loop then, so the same write wins.
+    srt = imap.sort(0).values
+    if fastest('getdata') and not (srt[1:] == srt[:-1]).any():
         # One scatter for all templates: the column of template k is
         # imap[:, k], and each spike's k comes from a lookup table.
         tsel = ix.nonzero()[:,0]

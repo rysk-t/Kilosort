@@ -10,9 +10,12 @@ def count_elements(kk, iclust, my_clus, xtree):
     return n1, n2
 
 def _members(iclust, labels, nlab):
-    """Same as np.isin(iclust, labels) for labels in [0, nlab), with a
+    """Same as np.isin(iclust, labels) for iclust in [0, nlab), with a
     lookup table instead of sorting."""
-    lut = np.zeros(max(nlab, max(labels) + 1), bool)
+    labels = np.asarray(labels)
+    if labels.size == 0 or labels.min() < 0 or (iclust.size and iclust.min() < 0):
+        return np.isin(iclust, labels)
+    lut = np.zeros(max(nlab, int(labels.max()) + 1), bool)
     lut[labels] = True
     return lut[iclust]
 
