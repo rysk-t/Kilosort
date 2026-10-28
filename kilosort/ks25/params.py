@@ -15,17 +15,16 @@ DEFAULT_SETTINGS25 = {
     'minFR': 1/50,           # minimum spike rate (Hz) of a template
     'momentum': (20.0, 400.0),  # number of spikes averaged into a template
     'sigmaMask': 30.0,       # spatial constant (um) of the channel mask
-    'ThPre': 8.0,            # threshold crossings for pre-clustering
     'spkTh': -6.0,           # single-channel spike threshold (SD)
     'nfilt_factor': 4,       # max templates per channel
     'useStableMode': 1,      # deterministic subtraction / averaging in mexMPnu8
     # constants of the MATLAB functions
     'NchanNear': 32,         # channels per template (learnTemplates)
     'Nnearest': 32,          # neighbor templates for the template features
-    'Nrank': 3,              # rank of the templates
     'NrankPC': 6,            # rank of the 1D PCs / number of wTEMP prototypes
+    # fixed in this port like in the MATLAB code: Nrank=3 (template rank),
+    # Nsum=min(Nchan, NchanNear, 7) (mexGetSpikes2); ThPre is unused by KS2.5
     'nInnerIter': 60,        # iterations of the matching pursuit per batch
-    'Nsum': 7,               # channels summed in mexGetSpikes2
     'loc_range': (5, 4),     # isolated_peaks_new
     'long_range': (30, 6),
     # speed knobs of this implementation (not in the MATLAB code)

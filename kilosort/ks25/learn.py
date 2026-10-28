@@ -351,13 +351,15 @@ def _mpnu_reference(p, X, U, W, mu, iC, iW, UtU, iList, wPCA):
                 dWU0=accum, drez=residual, nsp0=counts, featPC=pc)
 
 
-def _backend(name, *args):
+def _backend(name, *args, ops=None):
     try:
         from . import kernels
         fn = getattr(kernels, name, None)
     except ImportError:
         fn = None
     if fn is not None and args[1].is_cuda:
+        if name in ('get_spikes2', 'mpnu8'):
+            return fn(*args, matlab_tail=bool(_opt(ops or {}, 'matlab_tail', False)))
         return fn(*args)
     return {'get_spikes2': _get_spikes_reference, 'svd_small2': _svd_reference,
             'mpnu8': _mpnu_reference}[name](*args)
@@ -468,7 +470,7 @@ def learn_templates(ops, bfile, iorder, progress_bar=None):
         p[0], p[8] = X.shape[1], schedule[step]
         if step == 0:
             with profile.measure('get_spikes2'):
-                candidates, _ = _backend('get_spikes2', p, X, wTEMP, iC)
+                candidates, _ = _backend('get_spikes2', p, X, wTEMP, iC, ops=ops)
             candidates = candidates[:max_templates].double()
             if not len(candidates):
                 raise ValueError('No initial templates detected in the first learning batch')
@@ -481,7 +483,7 @@ def learn_templates(ops, bfile, iorder, progress_bar=None):
             W, dWU, nsp = W[:, order_idx].contiguous(), dWU[order_idx].contiguous(), nsp[order_idx].contiguous()
             p[1] = len(dWU)
         with profile.measure('svd_small2'):
-            W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
+            W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb, ops=ops)
         with profile.measure('get_me_utu'):
             utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
         with profile.measure('cast_and_ilist'):
@@ -489,7 +491,7 @@ def learn_templates(ops, bfile, iorder, progress_bar=None):
             ilist = torch.zeros((len(dWU), nnearest), dtype=torch.int32, device=X.device)
             U32, W32, mu32 = U.float().contiguous(), W.float().contiguous(), mu.float().contiguous()
         with profile.measure('mpnu8'):
-            result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA)
+            result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA, ops=ops)
         with profile.measure('dWU_update'):
             dWU, counts = _update_running_templates(dWU, result['dWU0'], result['nsp0'], schedule[step])
             nsp = .95*nsp + .05*counts
@@ -500,7 +502,7 @@ def learn_templates(ops, bfile, iorder, progress_bar=None):
             p[1] = len(dWU)
             if len(dWU) < max_templates:
                 with profile.measure('get_spikes2'):
-                    candidates, _ = _backend('get_spikes2', p, result['drez'], wTEMP, iC)
+                    candidates, _ = _backend('get_spikes2', p, result['drez'], wTEMP, iC, ops=ops)
                 if len(candidates):
                     ndrop[2] = .9*ndrop[2] + .1*len(candidates)
                     candidates = candidates[:max_templates - len(dWU)]
@@ -550,7 +552,7 @@ def track_and_sort(ops, bfile, rez, progress_bar=None):
     rows, fw, fpc = [], [], []
     batch_size, pad = int(_opt(ops, 'batch_size', 60000)), int(_opt(ops, 'nt', nt0))
     with profile.measure('svd_small2'):
-        W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb)
+        W, U, mu = _backend('svd_small2', p, dWU, W, iC, iW, Ka, Kb, ops=ops)
     with profile.measure('get_me_utu'):
         utu, _ = get_me_utu(iW, iC, mask, nnearest, nchan)
     with profile.measure('cast'):
@@ -561,7 +563,7 @@ def track_and_sort(ops, bfile, rez, progress_bar=None):
                 X = bfile.padded_batch_to_torch(batch, ops)
         p[0] = X.shape[1]
         with profile.measure('mpnu8'):
-            result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA)
+            result = _backend('mpnu8', p, X, U32, W32, mu32, iC, iW, utu, ilist, wPCA, ops=ops)
         with profile.measure('dWU_update'):
             total += result['dWU0']
             counts += result['nsp0'].double()

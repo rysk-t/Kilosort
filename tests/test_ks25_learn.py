@@ -68,13 +68,14 @@ class FakeFile:
 
 @pytest.mark.parametrize("stable", [0, 1])
 def test_final_extraction_window_and_absolute_times(monkeypatch, stable):
-    ops = {'nt0': 3, 'nt0min': 1, 'nt': 2, 'batch_size': 10, 'xc': [0, 1], 'yc': [0, 0], 'ks25': {'useStableMode': stable}}
+    ops = {'nt0': 3, 'nt0min': 1, 'nt': 2, 'batch_size': 10, 'xc': [0, 1], 'yc': [0, 0], 'ks25': {'useStableMode': stable, 'matlab_tail': True}}
     W = torch.tensor([[[1., 0, 0]]], dtype=torch.float64)
     U = torch.tensor([[[1., 0.]]], dtype=torch.float64)
     rez = {'W': W, 'U': U, 'mu': torch.tensor([2.], dtype=torch.float64),
            'wPCA': torch.ones((1, 3)), 'wTEMP': torch.ones((1, 3))}
     svd_calls = []
-    def backend(name, p, *args):
+    def backend(name, p, *args, **kwargs):
+        assert kwargs['ops']['ks25']['matlab_tail'] is True
         if name == 'svd_small2':
             svd_calls.append(1)
             return W, U, rez['mu']
@@ -98,10 +99,11 @@ def test_final_extraction_window_and_absolute_times(monkeypatch, stable):
 def test_learning_updates_average_and_uses_nested_settings(monkeypatch):
     ops = {'nt0': 3, 'nt0min': 1, 'nt': 2, 'batch_size': 10, 'fs': 10,
            'xc': [0, 1], 'yc': [0, 0],
-           'ks25': {'minFR': 0., 'momentum': [2., 2.], 'Th': [7., 3.], 'nInnerIter': 4},
+           'ks25': {'minFR': 0., 'momentum': [2., 2.], 'Th': [7., 3.], 'nInnerIter': 4, 'matlab_tail': True},
            'wTEMP': torch.ones((3, 3)), 'wPCA': torch.eye(3)}
     seen = []
-    def backend(name, p, *args):
+    def backend(name, p, *args, **kwargs):
+        assert kwargs['ops']['ks25']['matlab_tail'] is True
         if name == 'get_spikes2':
             if not seen:
                 return torch.tensor([[[2., 0, 0], [0., 0, 0]]]), None
@@ -176,7 +178,7 @@ def test_learning_caps_initial_templates_by_nfilt_factor(monkeypatch):
            'xc': [0, 1], 'yc': [0, 0], 'ks25': {'nfilt_factor': 1, 'minFR': 0.},
            'wTEMP': torch.ones((3, 3)), 'wPCA': torch.eye(3)}
     seen_counts = []
-    def backend(name, p, *args):
+    def backend(name, p, *args, **kwargs):
         if name == 'get_spikes2':
             candidates = torch.zeros((5, 2, 3))
             candidates[:, 0, 0] = torch.arange(1, 6)
@@ -254,7 +256,7 @@ def test_learning_skips_candidate_detection_at_capacity(monkeypatch):
            'xc': [0, 1], 'yc': [0, 0], 'ks25': {'nfilt_factor': .5, 'minFR': 0.},
            'wTEMP': torch.ones((3, 3)), 'wPCA': torch.eye(3)}
     calls = []
-    def backend(name, p, *args):
+    def backend(name, p, *args, **kwargs):
         if name == 'get_spikes2':
             calls.append(name)
             return torch.tensor([[[2., 0, 0], [0., 0, 0]]]), None
@@ -334,3 +336,28 @@ def test_triage_preserves_equal_rate_duplicates_and_empty_case():
     assert result[0].shape == (1, 0, 2)
     assert result[2].shape == (0, 2, 2)
     np.testing.assert_allclose(result[5], [1.2, 1.8, 3.])
+
+
+@pytest.mark.parametrize('name', ['get_spikes2', 'mpnu8'])
+def test_backend_forwards_matlab_tail_only_to_cuda(monkeypatch, name):
+    from kilosort.ks25 import kernels
+    class DeviceInput:
+        is_cuda = True
+    calls = []
+    monkeypatch.setattr(kernels, name, lambda *args, **kwargs: calls.append(kwargs))
+    learn._backend(name, np.zeros(17), DeviceInput(), ops={'ks25': {'matlab_tail': True}})
+    learn._backend(name, np.zeros(17), DeviceInput(), ops={'ks25': {'matlab_tail': False}})
+    assert calls == [{'matlab_tail': True}, {'matlab_tail': False}]
+
+
+def test_backend_does_not_forward_matlab_tail_to_reference_or_svd(monkeypatch):
+    from kilosort.ks25 import kernels
+    class DeviceInput:
+        is_cuda = True
+    calls = []
+    monkeypatch.setattr(kernels, 'svd_small2', lambda *args, **kwargs: calls.append(kwargs))
+    learn._backend('svd_small2', np.zeros(17), DeviceInput(), ops={'ks25': {'matlab_tail': True}})
+    assert calls == [{}]
+    monkeypatch.setattr(learn, '_get_spikes_reference', lambda *args: 'reference')
+    assert learn._backend('get_spikes2', np.zeros(17), torch.zeros(1),
+                          ops={'ks25': {'matlab_tail': True}}) == 'reference'
