@@ -846,9 +846,18 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
     nchan = ichan.nelement()
 
     dd = torch.zeros((nspikes, nchan, nfeatures))
-    for k,j in enumerate(ix.nonzero()[:,0]):
-        ij = torch.nonzero(pid==j)[:, 0]
-        dd[ij.unsqueeze(-1), imap[:,k]] = data[ij]
+    if fastest('getdata'):
+        # One scatter for all templates: the column of template k is
+        # imap[:, k], and each spike's k comes from a lookup table.
+        tsel = ix.nonzero()[:,0]
+        kpos = torch.zeros(int(tsel.max()) + 1, dtype=torch.long)
+        kpos[tsel] = torch.arange(tsel.numel())
+        cols = imap.T[kpos[pid]]
+        dd[torch.arange(nspikes).unsqueeze(-1), cols] = data
+    else:
+        for k,j in enumerate(ix.nonzero()[:,0]):
+            ij = torch.nonzero(pid==j)[:, 0]
+            dd[ij.unsqueeze(-1), imap[:,k]] = data[ij]
 
     if merge_dim:
         Xd = torch.reshape(dd, (nspikes, -1))
