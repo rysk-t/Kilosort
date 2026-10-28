@@ -619,6 +619,8 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     # The neighbor search runs on the GPU in the main thread instead (much
     # faster than faiss for the large centers of long recordings).
     knn_gpu = torch.device(device).type == 'cuda' and fastest('knn')
+    # The regressions of swarmsplitter.split also run on the GPU.
+    split_gpu = torch.device(device).type == 'cuda' and fastest('splitgpu')
 
     def prepare_center(jj, kk):
         ix = (nearest_center == kk + jj*ycent.size)
@@ -695,8 +697,9 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         st0 = None
 
                     Xg = None
-                    if knn_gpu:
+                    if knn_gpu or split_gpu:
                         Xg = Xd.to(device)
+                    if knn_gpu:
                         kn, M = neigh_mat_gpu(Xg, nskip=nskip, n_neigh=n_neigh,
                                               max_sub=max_sub)
 
@@ -706,7 +709,6 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                         max_sub=max_sub, lam=1, seed=seed, device=device,
                         verbose=v, Xg=Xg
                         )
-                    del Xg
 
                     if clear_cache:
                         if v:
@@ -722,8 +724,10 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
 
                     xtree, tstat = swarmsplitter.split(
-                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0
+                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0,
+                        Xg=Xg if split_gpu else None
                         )
+                    del Xg
 
                     iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
 

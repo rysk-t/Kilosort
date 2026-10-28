@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from numba import njit
 import math
 from kilosort.CCG import compute_CCG, CCG_metrics
@@ -38,6 +39,29 @@ def check_split(Xd, kk, xtree, iclust, my_clus, ix1=None, ix2=None):
     CC = CC + .01 * np.eye(CC.shape[0])
     b = np.linalg.solve(CC, labels @ (Xs * w))
     xproj = Xs @ b
+
+    score = bimod_score(xproj)
+    return xproj, score
+
+def check_split_device(Xg, ix1, ix2):
+    """`check_split` (with ix1, ix2) on the device of Xg, the features of
+    the same spikes as Xd. Same float64 arithmetic, so only the order of the
+    sums differs from the CPU version."""
+    ixy = ix1 | ix2
+    sel = torch.from_numpy(np.nonzero(ixy)[0]).to(Xg.device)
+    labels = torch.from_numpy(2*ix1[ixy] - 1).to(Xg.device, torch.float64)
+    Xs = Xg.index_select(0, sel).double()
+    Xs[:,-1] = 1
+
+    npos = (labels > 0).double().mean()
+    nneg = (labels < 0).double().mean()
+    w = torch.where(labels > 0, nneg, npos).unsqueeze(1)
+
+    Xw = Xs * w
+    CC = Xs.T @ Xw
+    CC = CC + .01 * torch.eye(CC.shape[0], dtype=CC.dtype, device=CC.device)
+    b = torch.linalg.solve(CC, labels @ Xw)
+    xproj = (Xs @ b).cpu().numpy()
 
     score = bimod_score(xproj)
     return xproj, score
@@ -99,7 +123,9 @@ def refractoriness(st1, st2):
         #    print('good cluster becomes bad')
     return criterion
 
-def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
+def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None,
+          Xg = None):
+    # Xg: optional copy of Xd on the GPU, used for the bimodality regression.
     xtree = np.array(xtree)
 
     kk = xtree.shape[0]-1
@@ -128,7 +154,10 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
             #criterion = 0
         
         if criterion==0:
-            xproj, score = check_split(Xd, kk, xtree, iclust, my_clus, ix1, ix2)
+            if Xg is not None:
+                xproj, score = check_split_device(Xg, ix1, ix2)
+            else:
+                xproj, score = check_split(Xd, kk, xtree, iclust, my_clus, ix1, ix2)
             # third mutation is bimodality
             #xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
             criterion = 2 * (score <  .6) - 1
