@@ -13,7 +13,7 @@ from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
 from kilosort import fused_kernels
-from kilosort.utils import template_path, log_performance
+from kilosort.utils import template_path, log_performance, fastest
 
 
 def my_max2d(X, dt):
@@ -237,7 +237,12 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     nsizes = ops['settings']['template_sizes']
     nb = ops['Nbatches']
 
-    if ops['settings']['templates_from_data']:
+    if (ops['settings']['templates_from_data'] and fastest('wpca_reuse')
+            and ops.pop('_templates_from_data', False)):
+        # Computed from this recording in the drift pass (before drift
+        # correction) instead of a second time (fastest).
+        logger.info('Reusing universal templates computed from data.')
+    elif ops['settings']['templates_from_data']:
         logger.info('Re-computing universal templates from data.')
         # Determine templates and PC features from data.
         ops['wPCA'], ops['wTEMP'] = extract_wPCA_wTEMP(
@@ -245,6 +250,9 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             Th_single_ch=ops['settings']['Th_single_ch'], nskip=25,
             device=device
             )
+        if not return_features and fastest('wpca_reuse'):
+            # drift pass: the next pass (detect_univ) may reuse them
+            ops['_templates_from_data'] = True
     else:
         logger.info('Using built-in universal templates.')
         # Use pre-computed templates.
