@@ -135,7 +135,10 @@ def _draw_diagnostics(wPCA, features, mean_amp, clu0, fs, results_dir):
     plt.close(fig)
 
 
-def _spike_positions_figure(clu, is_refractory, positions):
+def _spike_positions_figure(clu, is_refractory, positions, corners_only=False):
+    # corners_only: draw only the two corners of the positions' bounding box,
+    # which gives the same data limits, axes and layout (the strips replace
+    # the markers anyway) without setting up millions of markers.
     plt.style.use('dark_background')
     fig, ax = plt.subplots(1, 1, figsize=(30,14))
 
@@ -149,7 +152,16 @@ def _spike_positions_figure(clu, is_refractory, positions):
 
     # Get x, y positions, add to scatterplot
     xs, ys = positions[:,0], positions[:,1]
-    points = ax.scatter(ys, xs, s=3, c=colors)
+    if corners_only:
+        ok = np.isfinite(xs) & np.isfinite(ys)
+        if ok.any():
+            xs = np.array([xs[ok].min(), xs[ok].max()])
+            ys = np.array([ys[ok].min(), ys[ok].max()])
+            points = ax.scatter(ys, xs, s=3, c=colors[:2])
+        else:
+            corners_only = False
+    if not corners_only:
+        points = ax.scatter(ys, xs, s=3, c=colors)
     ax.set_xlabel('Depth (um)', fontsize=22)
     ax.set_ylabel('Lateral (um)', fontsize=22)
     fig.suptitle('Spike position across probe, colored by cluster', fontsize=30)
@@ -185,7 +197,12 @@ def _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out):
     in the full plot, so the strips put side by side give the same image.
     """
     import io as _io
-    fig, ax, points, colors = _spike_positions_figure(clu, is_refractory, positions)
+    # This file is loaded on its own in the plotting process (no kilosort
+    # package, see _BackgroundPlots), so read KS_FASTEST_OFF directly.
+    corners = 'plot_corners' not in os.environ.get('KS_FASTEST_OFF', '').split(',')
+    fig, ax, points, colors = _spike_positions_figure(
+        clu, is_refractory, positions, corners_only=corners
+        )
     ax.set_xlim(ax.get_xlim())
     ax.set_ylim(ax.get_ylim())
     W = int(round(fig.get_figwidth() * _POSITIONS_DPI))
@@ -202,8 +219,27 @@ def _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out):
     c0, c1 = edges[k], edges[k+1]
 
     keep = (px >= c0 - _STRIP_MARGIN) & (px < c1 + _STRIP_MARGIN)
-    points.set_offsets(xy[keep])
-    points.set_facecolor(colors[keep])
+    if 'plot_bycolor' in os.environ.get('KS_FASTEST_OFF', '').split(','):
+        points.set_offsets(xy[keep])
+        points.set_facecolor(colors[keep])
+    else:
+        # Single-color scatters (one per palette entry, in 16 consecutive
+        # chunks of spikes so that later spikes still mostly end up on top):
+        # matplotlib then draws them with its fast marker path instead of one
+        # path per spike (~15 us each). Only the stacking of overlapping
+        # markers of different colors within a chunk differs from the plot
+        # drawn in spike order.
+        bad_units = np.unique(clu)[is_refractory == 0]
+        palette_idx = np.mod(np.arange(int(clu.max()) + 1), 9)
+        palette_idx[bad_units] = 9
+        pal = palette_idx[clu]
+        points.remove()
+        idx = np.nonzero(keep)[0]
+        for chunk in np.array_split(idx, 16):
+            for g in range(10):
+                sel = chunk[pal[chunk] == g]
+                if sel.size:
+                    ax.scatter(xy[sel, 0], xy[sel, 1], s=3, c=PROBE_PLOT_COLORS[g:g+1])
     buf = _io.BytesIO()
     fig.savefig(buf, format='raw', dpi=_POSITIONS_DPI)
     plt.style.use('default')
@@ -321,7 +357,8 @@ class BackgroundSpikePositions:
         from pathlib import Path
         self._results_dir = Path(results_dir)
         if n_strips is None:
-            n_strips = 1 if len(clu) < 300_000 else min(6, os.cpu_count() or 1)
+            n_strips = 1 if len(clu) < 300_000 else min(
+                12 if len(clu) > 3_000_000 else 6, os.cpu_count() or 1)
         self._tmpdir = None
         if n_strips <= 1:
             self._procs = [_BackgroundPlots(
