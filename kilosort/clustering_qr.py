@@ -98,16 +98,22 @@ def neigh_mat_gpu(Xg, nskip=1, n_neigh=10, max_sub=25000):
         d = torch.addmm(sq.unsqueeze(0), Xg[s:s+chunk], Xsub.T, alpha=-2)
         kn[s:s+chunk] = torch.topk(d, n_neigh, dim=1, largest=False).indices
 
-    kn_np = kn.cpu().numpy()
-    dexp = np.ones(kn_np.size, np.float32)
-    rows = np.repeat(np.arange(n_samples), n_neigh)
-    M = csr_matrix((dexp, (rows, kn_np.ravel())), (n_samples, n_nodes))
-
-    # self connections are set to 0
     skip_idx = np.arange(0, n_samples, nskip)
     if rev_idx is not None:
         skip_idx = skip_idx[rev_idx]
-    M[skip_idx, np.arange(n_nodes)] = 0
+
+    # Every row has exactly n_neigh distinct columns, so the CSR arrays can be
+    # written directly (sorted columns, as scipy's COO conversion gives).
+    # Self connections are stored as explicit zeros, like
+    # M[skip_idx, np.arange(n_nodes)] = 0 does when they are present; a
+    # missing one is simply absent, which gives the same sums and products.
+    cols = torch.sort(kn, dim=1).values
+    self_col = torch.full((n_samples,), -1, dtype=torch.int64, device=Xg.device)
+    self_col[torch.from_numpy(skip_idx).to(Xg.device)] = torch.arange(n_nodes, device=Xg.device)
+    data = (cols != self_col.unsqueeze(1)).to(torch.float32)
+    M = csr_matrix((data.cpu().numpy().ravel(), cols.cpu().numpy().ravel(),
+                    np.arange(0, n_samples * n_neigh + 1, n_neigh)),
+                   (n_samples, n_nodes))
 
     return kn, M
 
