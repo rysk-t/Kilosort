@@ -1071,3 +1071,71 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     th_amps = th_amps[:k]
 
     return st, amps, th_amps, Xres
+
+
+# --------------------------------------------------------------------------
+# clustering_qr: assign each spike to a cluster from its neighbors' labels
+# --------------------------------------------------------------------------
+_SOURCES['assign'] = r"""
+typedef unsigned long long ptr_t;
+// iclust[i] = argmax_c (#{k: isub[kn[i,k]] == c} - coef * (ki[i] * kN[c])),
+// ties to the smallest c. Only the neighbors' clusters and the first cluster
+// of `top` (clusters by increasing kN) that no neighbor has can win; the
+// scores are rounded like clustering_qr._assign_iclust_sparse.
+extern "C" __global__
+void assign_iclust_kernel(ptr_t pisub, ptr_t pkn, ptr_t pkN, ptr_t pki, ptr_t ptop,
+                          ptr_t pout, int n, float coef)
+{
+    const long long* isub = (const long long*)pisub;
+    const long long* kn = (const long long*)pkn;
+    const float* kN = (const float*)pkN;
+    const float* ki = (const float*)pki;
+    const long long* top = (const long long*)ptop;
+    long long* out = (long long*)pout;
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    long long L[K];
+    #pragma unroll
+    for (int k = 0; k < K; ++k) L[k] = isub[kn[(long long)i * K + k]];
+    const float kii = ki[i];
+    float best = 0.0f;
+    long long bid = -1;
+    #pragma unroll
+    for (int k = 0; k < K; ++k) {
+        int cnt = 0;
+        #pragma unroll
+        for (int j = 0; j < K; ++j) cnt += (L[j] == L[k]);
+        float s = __fsub_rn((float)cnt, __fmul_rn(coef, __fmul_rn(kii, kN[L[k]])));
+        if (bid < 0 || s > best || (s == best && L[k] < bid)) { best = s; bid = L[k]; }
+    }
+    for (int t = 0; t <= K; ++t) {
+        long long c = top[t];
+        bool taken = false;
+        #pragma unroll
+        for (int j = 0; j < K; ++j) taken |= (L[j] == c);
+        if (taken) continue;
+        float s = __fsub_rn(0.0f, __fmul_rn(coef, __fmul_rn(kii, kN[c])));
+        if (s > best || (s == best && c < bid)) { best = s; bid = c; }
+        break;
+    }
+    out[i] = bid;
+}
+"""
+
+
+def assign_iclust(isub, kn, kN, ki, top, coef):
+    """Kernel version of the last step of clustering_qr._assign_iclust_sparse
+    (kN: cluster sizes, top: the K+1 clusters with the smallest kN in order,
+    coef: lam/m as float32). Can be recorded in a CUDA graph once loaded."""
+    n, K = kn.shape
+    if not (isub.dtype == kn.dtype == top.dtype == torch.int64
+            and kN.dtype == ki.dtype == torch.float32):
+        raise ValueError('unsupported dtype for fused assign_iclust')
+    isub, kn, kN, ki, top = (t.contiguous() for t in (isub, kn, kN, ki, top))
+    out = torch.empty(n, dtype=torch.int64, device=kn.device)
+    f = _function('assign', 'assign_iclust_kernel', (('K', K),))
+    tpb = 256
+    with _stream():
+        f(((n + tpb - 1) // tpb,), (tpb,),
+          (_p(isub), _p(kn), _p(kN), _p(ki), _p(top), _p(out), np.int32(n), np.float32(coef)))
+    return out

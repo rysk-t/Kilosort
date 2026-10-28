@@ -14,7 +14,7 @@ from scipy.cluster.vq import kmeans
 import faiss
 from tqdm import tqdm 
 
-from kilosort import hierarchical, swarmsplitter
+from kilosort import fused_kernels, hierarchical, swarmsplitter
 from kilosort.utils import log_performance, fastest
 
 logger = logging.getLogger(__name__)
@@ -128,6 +128,24 @@ def _counts(idx, n, like):
     return c.unsqueeze(0)
 
 
+_assign_kernel_state = {}
+
+
+def _assign_kernel_ok():
+    """Whether the CuPy kernel for assign_iclust can be used (CuPy present
+    and the kernel compiles). Checked once, outside of any graph capture."""
+    if 'ok' not in _assign_kernel_state:
+        ok = fused_kernels.enabled()
+        if ok:
+            try:
+                fused_kernels._function('assign', 'assign_iclust_kernel', (('K', 10),))
+            except Exception as e:
+                logger.info(f'assign_iclust kernel unavailable ({e!r}); using PyTorch.')
+                ok = False
+        _assign_kernel_state['ok'] = ok
+    return _assign_kernel_state['ok']
+
+
 def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
     """Same result as the dense `assign_iclust` for lam > 0, without the
     (n_spikes, nclust) score matrix.
@@ -138,9 +156,12 @@ def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
     are computed with the same operations as the dense version, and ties go
     to the smallest cluster index as in torch.argmax.
     """
-    L = isub[kn]                                   # (n_spikes, n_neigh)
-    K = L.shape[1]
+    K = kn.shape[1]
     kN = _counts(isub, nclust, tones2)[0]
+    if kn.is_cuda and _assign_kernel_ok() and fastest('assign_kernel'):
+        top = torch.sort(kN, stable=True).indices[:K+1]
+        return fused_kernels.assign_iclust(isub, kn, kN, ki, top, lam/m)
+    L = isub[kn]                                   # (n_spikes, n_neigh)
     cnt = (L.unsqueeze(2) == L.unsqueeze(1)).sum(2).to(tones2.dtype)
     s_nb = cnt - lam/m * (ki.unsqueeze(-1) * kN[L])
     # Best cluster outside the neighbors: first of the K+1 smallest kN
