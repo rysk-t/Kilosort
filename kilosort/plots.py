@@ -46,12 +46,13 @@ def plot_drift_amount(ops, results_dir, tmin=0):
     plt.close(fig)
 
 
-def plot_drift_scatter(st0, results_dir, tmin=0):
+def _drift_scatter_figure(st0, tmin=0, corners_only=False):
+    # See _spike_positions_figure for corners_only.
     fig, ax = plt.subplots(1, 1, figsize=(30,14))
 
     x = st0[:,0] + tmin  # spike time in seconds
     y = st0[:,1]         # depth of spike center in microns
-    z = st0[:,2]         # spike amplitude (data)
+    z = st0[:,2].copy()  # spike amplitude (data)
     z[z < 10] = 10
     z[z > 100] = 100
     colors = np.empty((x.shape[0], 4), dtype=float)
@@ -66,11 +67,21 @@ def plot_drift_scatter(st0, results_dir, tmin=0):
     
     # Scatter of spike depth over time, with color intensity proportional
     # to log of amplitude.
-    ax.scatter(x, y, s=3, c=colors)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if corners_only and ok.any():
+        points = ax.scatter([x[ok].min(), x[ok].max()], [y[ok].min(), y[ok].max()],
+                            s=3, c=colors[:2])
+    else:
+        points = ax.scatter(x, y, s=3, c=colors)
     ax.set_xlabel('Time (s)', fontsize=22)
     ax.set_ylabel('Depth (um)', fontsize=22)
     fig.suptitle('Spike amplitude across time and depth', fontsize=30)
     fig.tight_layout()
+    return fig, ax, points, colors, np.column_stack((x, y))
+
+
+def plot_drift_scatter(st0, results_dir, tmin=0):
+    fig, _, _, _, _ = _drift_scatter_figure(st0, tmin)
 
     save_path = results_dir / 'drift_scatter.png'
     fig.savefig(save_path, dpi=300)
@@ -185,6 +196,37 @@ _POSITIONS_DPI = 300
 # Pixels added on each side of a strip when selecting the spikes to draw in
 # it; must exceed the marker radius plus antialiasing (about 7 px at dpi 300).
 _STRIP_MARGIN = 20
+
+
+def _render_strip(fig, ax, points, colors, xy, k, n_strips, out, dpi):
+    """Pixel columns of strip `k` of a scatter figure (as in
+    _spike_positions_strip): only the markers that reach into the strip are
+    drawn, in their original order and colors."""
+    import io as _io
+    ax.set_xlim(ax.get_xlim())
+    ax.set_ylim(ax.get_ylim())
+    W = int(round(fig.get_figwidth() * dpi))
+    H = int(round(fig.get_figheight() * dpi))
+    px = (ax.transData + fig.transFigure.inverted()).transform(xy)[:,0] * W
+    finite = px[np.isfinite(px)]
+    inner = np.quantile(finite, np.arange(1, n_strips) / n_strips) if finite.size else []
+    edges = np.concatenate(([0], np.clip(np.round(inner), 0, W), [W])).astype(int)
+    edges = np.maximum.accumulate(edges)
+    c0, c1 = edges[k], edges[k+1]
+    keep = (px >= c0 - _STRIP_MARGIN) & (px < c1 + _STRIP_MARGIN)
+    points.set_offsets(xy[keep])
+    points.set_facecolor(colors[keep])
+    buf = _io.BytesIO()
+    fig.savefig(buf, format='raw', dpi=dpi)
+    plt.close(fig)
+    image = np.frombuffer(buf.getvalue(), np.uint8).reshape(H, W, 4)
+    np.save(out, image[:, c0:c1])
+
+
+def _drift_scatter_strip(st0, tmin, k, n_strips, out):
+    """Strip `k` of the drift scatter plot (the same png when put together)."""
+    fig, ax, points, colors, xy = _drift_scatter_figure(st0, tmin, corners_only=True)
+    _render_strip(fig, ax, points, colors, xy, k, n_strips, out, 300)
 
 
 def _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out):
@@ -313,9 +355,10 @@ class _BackgroundPlots:
 
 
 class BackgroundDriftPlots(_BackgroundPlots):
-    """`plot_drift_amount` and `plot_drift_scatter` in a separate process."""
+    """`plot_drift_amount` and `plot_drift_scatter` in a separate process
+    (the scatter in parallel strips for many spikes, see _BackgroundStrips)."""
 
-    def __init__(self, ops, st0, results_dir, tmin=0):
+    def __init__(self, ops, st0, results_dir, tmin=0, n_strips=None):
         from pathlib import Path
         import torch
         dshift = ops['dshift']
@@ -326,8 +369,83 @@ class BackgroundDriftPlots(_BackgroundPlots):
             'settings': {'fs': ops['settings']['fs'],
                          'batch_size': ops['settings']['batch_size']},
             }
-        super().__init__('_drift_plots_from_file',
-                         (mini_ops, st0, Path(results_dir), tmin), 'Drift plots')
+        if n_strips is None:
+            n_strips = 1 if len(st0) < 300_000 else min(4, os.cpu_count() or 1)
+        off = os.environ.get('KS_FASTEST_OFF', '').split(',')
+        if n_strips <= 1 or 'drift_strips' in off:
+            self._strips = None
+            super().__init__('_drift_plots_from_file',
+                             (mini_ops, st0, Path(results_dir), tmin), 'Drift plots')
+        else:
+            # The amount plot in this process, the scatter (~15 us per
+            # marker) in strips.
+            self._strips = _BackgroundStrips(
+                '_drift_scatter_strip_from_file', (np.asarray(st0), tmin),
+                n_strips, Path(results_dir) / 'drift_scatter.png', 'Drift scatter plot')
+            super().__init__('_drift_amount_from_file',
+                             (mini_ops, Path(results_dir), tmin), 'Drift plots')
+
+    def wait(self):
+        super().wait()
+        if self._strips is not None:
+            self._strips.wait()
+
+    def cancel(self):
+        super().cancel()
+        if self._strips is not None:
+            self._strips.cancel()
+
+
+class _BackgroundStrips:
+    """A scatter plot drawn as `n_strips` vertical strips in parallel
+    processes (`func_name(args_path, k, n_strips, out)` writes strip k), put
+    together into `png` in `wait()`."""
+
+    def __init__(self, func_name, args, n_strips, png, what):
+        import pickle, tempfile
+        self._png = png
+        self._tmpdir = tempfile.mkdtemp(prefix='ks_strips_')
+        args_path = os.path.join(self._tmpdir, 'args.pkl')
+        with open(args_path, 'wb') as f:
+            pickle.dump(args, f)
+        self._strips = [os.path.join(self._tmpdir, f'strip_{k}.npy')
+                        for k in range(n_strips)]
+        self._procs = [
+            _BackgroundPlots(func_name, None, what, args_path=args_path,
+                             call_args=(k, n_strips, self._strips[k]))
+            for k in range(n_strips)
+            ]
+
+    def wait(self):
+        import shutil
+        from matplotlib import image
+        try:
+            errors = []
+            for p in self._procs:
+                try:
+                    p.wait()
+                except RuntimeError as e:
+                    errors.append(e)
+            if errors:
+                raise errors[0]
+            if self._strips:
+                strips = [np.load(s) for s in self._strips]
+                self._strips = []
+                # Same call as savefig's png writer, so the file is the same.
+                image.imsave(self._png, np.concatenate(strips, axis=1), format='png',
+                             origin='upper', dpi=300)
+        finally:
+            if self._tmpdir is not None:
+                shutil.rmtree(self._tmpdir, ignore_errors=True)
+                self._tmpdir = None
+
+    def cancel(self):
+        import shutil
+        for p in self._procs:
+            p.cancel()
+        if self._tmpdir is not None:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
 
 
 class BackgroundDiagnostics(_BackgroundPlots):
@@ -423,6 +541,20 @@ def _drift_plots_from_file(path):
         mini_ops, st0, results_dir, tmin = pickle.load(f)
     plot_drift_amount(mini_ops, results_dir, tmin=tmin)
     plot_drift_scatter(st0, results_dir, tmin=tmin)
+
+
+def _drift_amount_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        mini_ops, results_dir, tmin = pickle.load(f)
+    plot_drift_amount(mini_ops, results_dir, tmin=tmin)
+
+
+def _drift_scatter_strip_from_file(path, k, n_strips, out):
+    import pickle
+    with open(path, 'rb') as f:
+        st0, tmin = pickle.load(f)
+    _drift_scatter_strip(st0, tmin, k, n_strips, out)
 
 
 def _diagnostics_from_file(path):
