@@ -39,8 +39,10 @@ def get_kernels(ops, nup=10, sig=1):
         return torch.exp(-d.square() / sig**2)
     kxx, kyx = kernel(xs, xs), kernel(ys, xs)
     b = torch.linalg.solve(kxx + .01 * torch.eye(nt, dtype=xs.dtype, device=device), kyx.T).T
-    b = b.reshape(nt, nup, nt).permute(1, 0, 2).contiguous()
-    return b[:, peak, :].T.contiguous(), b
+    b = b.reshape(nt, nup, nt)
+    ka = b[peak].T.contiguous()
+    kb = b.permute(1, 2, 0).contiguous()
+    return ka, kb
 
 
 def get_closest_channels(ops, sigma, NchanClosest):
@@ -243,7 +245,7 @@ def _svd_reference(p, dWU, W, iC, iW, Ka, Kb):
         shifted = torch.roll(outW[:, f], -shift, dims=-1)
         ups = Ka.T @ shifted[0]
         best = int(ups.abs().argmax())
-        outW[:, f] = shifted @ Kb[best].T
+        outW[:, f] = shifted @ Kb[best]
         outW[0, f] *= -torch.where(ups[best] < 0, -1., 1.)
     return outW.contiguous(), outU.contiguous(), mu
 

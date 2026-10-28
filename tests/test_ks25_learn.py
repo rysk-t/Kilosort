@@ -9,8 +9,8 @@ def test_get_kernels_interpolates_and_layout():
     ka, kb = learn.get_kernels({'nt0': 7, 'nt0min': 3}, nup=10)
     assert ka.shape == (7, 10)
     assert kb.shape == (10, 7, 7)
-    torch.testing.assert_close(ka.T, kb[:, 2, :])
-    torch.testing.assert_close(kb[5] @ torch.ones(7, dtype=torch.float64),
+    torch.testing.assert_close(ka.T, kb[:, :, 2])
+    torch.testing.assert_close(torch.ones(7, dtype=torch.float64) @ kb[5],
                                torch.full((7,), 1 / (1 + .01 / (1 + 2*np.exp(-1) + 2*np.exp(-4) + 2*np.exp(-9))), dtype=torch.float64))
 
 
