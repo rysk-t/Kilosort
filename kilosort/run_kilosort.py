@@ -373,17 +373,19 @@ def _sort(filename, results_dir, probe, settings, data_dtype, device, do_CAR,
 
         # This makes sure the full traceback is written to log file.
         logger.exception('Encountered error in `run_kilosort`:')
-        # Don't leave plotting processes and their temporary files behind.
-        for p in background_plots:
-            try:
-                p.cancel()
-            except Exception:
-                pass
         # Annoyingly, this will print the error message twice for console, but
         # I haven't found a good way around that.
         raise
     
     finally:
+        # Don't leave plotting processes and their temporary files behind
+        # after an error or an interrupt (Ctrl+C). After a normal run the
+        # list is empty.
+        for p in background_plots:
+            try:
+                p.cancel()
+            except Exception:
+                pass
         close_logger()
 
 
@@ -1173,7 +1175,8 @@ def load_sorting(results_dir, device=None, load_extra_vars=False):
     ccg_threshold = ops['settings']['ccg_threshold']
     is_ref, est_contam_rate = CCG.refract(clu, st / ops['fs'],
                                           acg_threshold=acg_threshold,
-                                          ccg_threshold=ccg_threshold)
+                                          ccg_threshold=ccg_threshold,
+                                          device=device)
 
     results = [ops, st, clu, similar_templates, is_ref,
                est_contam_rate, kept_spikes]

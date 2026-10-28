@@ -63,7 +63,7 @@ def compute_spike_positions(st, tF, ops):
     return xs, ys
 
 
-def make_pc_features(ops, spike_templates, spike_clusters, tF):
+def make_pc_features(ops, spike_templates, spike_clusters, tF, device=None):
     '''Get PC Features and corresponding indices for export to Phy.
 
     NOTE: This function will update tF in-place!
@@ -109,11 +109,11 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
 
     # Group spikes by cluster once instead of scanning all spikes per cluster.
     clusters = np.unique(spike_clusters)
-    corder = stable_argsort(spike_clusters)
+    corder = stable_argsort(spike_clusters, device)
     csorted = spike_clusters[corder]
     starts = np.searchsorted(csorted, clusters, side='left')
     ends = np.searchsorted(csorted, clusters, side='right')
-    template_groups = _template_groups(spike_templates)
+    template_groups = _template_groups(spike_templates, device)
 
     for i, cs, ce in zip(clusters, starts, ends):
         # Get templates associated with cluster (often just 1)

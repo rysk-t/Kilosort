@@ -432,7 +432,8 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     ccg_threshold = ops['settings']['ccg_threshold']
     is_ref, est_contam_rate = CCG.refract(spike_clusters, spike_times / ops['fs'],
                                           acg_threshold=acg_threshold,
-                                          ccg_threshold=ccg_threshold)
+                                          ccg_threshold=ccg_threshold,
+                                          device=Wall.device)
     log_performance(logger, level='debug', header='save_to_phy, est contam',
                     reset=True)
     if on_refract is not None:
@@ -458,7 +459,7 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # so the extra memory hopefully won't be an issue.
     tF = tF[kept_spikes]
     pc_features, pc_feature_ind = make_pc_features(
-        ops, spike_templates, spike_clusters, tF
+        ops, spike_templates, spike_clusters, tF, device=Wall.device
         )
     if fastest('mmap_save'):
         _save_mapped(results_dir / 'pc_features.npy', pc_features)
@@ -1161,6 +1162,8 @@ class BinaryFiltered(BinaryRWFile):
         smallest E that keeps all but 1e-10 of sum |h|, and X is extended
         circularly by E samples on each side, after which a linear
         correlation of length >= NT + 2E gives the same result up to rounding.
+        Returns None if h can't be truncated like that (e.g. X is shorter
+        than the impulse response); the caller then uses the default filter.
         """
         NT = X.shape[1]
         cached = self.__dict__.get('_fwav_circ')
@@ -1180,16 +1183,21 @@ class BinaryFiltered(BinaryRWFile):
             kept = (np.cumsum(a[cc:cc+emax+1])
                     + np.concatenate(([0.0], np.cumsum(a[cc-1::-1][:emax]))))
             enough = kept >= a.sum() * (1 - 1e-10)
-            Emin = int(np.argmax(enough)) if enough.any() else emax
-            N = _fast_fft_length(NT + 2 * Emin)
-            E = min((N - NT) // 2, emax)
-            g = torch.zeros(N, device=h.device)
-            g[:E+1] = h[c:c+E+1]
-            g[N-E:] = h[c-E:c]
-            idx = (torch.arange(NT + 2*E, device=X.device) - E + o) % NT
-            cached = (self.hp_filter, NT, N, E, torch.conj(rfft(g)), idx)
+            if not enough.any():
+                cached = (self.hp_filter, NT, None)
+            else:
+                Emin = int(np.argmax(enough))
+                N = _fast_fft_length(NT + 2 * Emin)
+                E = min((N - NT) // 2, emax)
+                g = torch.zeros(N, device=h.device)
+                g[:E+1] = h[c:c+E+1]
+                g[N-E:] = h[c-E:c]
+                idx = (torch.arange(NT + 2*E, device=X.device) - E + o) % NT
+                cached = (self.hp_filter, NT, (N, E, torch.conj(rfft(g)), idx))
             self._fwav_circ = cached
-        N, E, fg, idx = cached[2:]
+        if cached[2] is None:
+            return None
+        N, E, fg, idx = cached[2]
         Z = irfft(rfft(X[:, idx], n=N) * fg, n=N)
         return Z[:, E:E+NT].contiguous()
 
@@ -1219,8 +1227,9 @@ class BinaryFiltered(BinaryRWFile):
         if self.hp_filter is not None:
             if fast_approx() and self.hp_filter.shape[0] <= X.shape[1]:
                 X = self._highpass_padded(X)
-            elif fastest('hpfilter') and X.shape[1] > 2 * 800:
-                X = self._highpass_circular(X)
+            elif (fastest('hpfilter')
+                  and (Y := self._highpass_circular(X)) is not None):
+                X = Y
             else:
                 fwav = self._fft_highpass(X.shape[1])
                 X = torch.real(ifft(fft(X) * torch.conj(fwav)))

@@ -705,7 +705,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     centers = [(jj, kk) for jj in range(len(xcent)) for kk in range(len(ycent))
                if kk + jj*ycent.size in nearest_center]
     iC_cpu = iC.cpu() if torch.is_tensor(iC) else iC
-    template_groups = _template_groups(iclust_template)
+    template_groups = _template_groups(iclust_template, device)
     # The neighbor search runs on the GPU in the main thread instead (much
     # faster than faiss for the large centers of long recordings).
     knn_gpu = torch.device(device).type == 'cuda' and fastest('knn')
@@ -882,7 +882,7 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     return clu, Wall
 
 
-def _template_groups(PID):
+def _template_groups(PID, device=None):
     """Group spike indices by template with one stable argsort.
 
     The result is a snapshot: callers may reuse it while PID is unchanged.
@@ -891,7 +891,7 @@ def _template_groups(PID):
     if torch.is_tensor(PID):
         PID = PID.detach().cpu().numpy()
     nvals = int(PID.max()) + 1 if PID.size else 0
-    order = stable_argsort(PID)
+    order = stable_argsort(PID, device)
     bounds = np.searchsorted(PID[order], np.arange(nvals + 1))
     return order, bounds
 

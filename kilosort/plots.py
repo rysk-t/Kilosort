@@ -328,7 +328,12 @@ class _BackgroundPlots:
         """Wait for the plots; raise if the plotting process failed."""
         if self._proc is None:
             return
-        _, err = self._proc.communicate()
+        try:
+            _, err = self._proc.communicate()
+        except BaseException:
+            # e.g. KeyboardInterrupt: don't leave the process running.
+            self.cancel()
+            raise
         code, self._proc = self._proc.returncode, None
         if self._owns_args:
             try:
@@ -382,11 +387,20 @@ class BackgroundDriftPlots(_BackgroundPlots):
             self._strips = _BackgroundStrips(
                 '_drift_scatter_strip_from_file', (np.asarray(st0), tmin),
                 n_strips, Path(results_dir) / 'drift_scatter.png', 'Drift scatter plot')
-            super().__init__('_drift_amount_from_file',
-                             (mini_ops, Path(results_dir), tmin), 'Drift plots')
+            try:
+                super().__init__('_drift_amount_from_file',
+                                 (mini_ops, Path(results_dir), tmin), 'Drift plots')
+            except BaseException:
+                self._strips.cancel()
+                raise
 
     def wait(self):
-        super().wait()
+        try:
+            super().wait()
+        except BaseException:
+            if self._strips is not None:
+                self._strips.cancel()
+            raise
         if self._strips is not None:
             self._strips.wait()
 
@@ -399,27 +413,34 @@ class BackgroundDriftPlots(_BackgroundPlots):
 class _BackgroundStrips:
     """A scatter plot drawn as `n_strips` vertical strips in parallel
     processes (`func_name(args_path, k, n_strips, out)` writes strip k), put
-    together into `png` in `wait()`."""
+    together into `png` in `wait()`. The processes are stopped and the
+    temporary files removed also when waiting fails or is interrupted."""
 
-    def __init__(self, func_name, args, n_strips, png, what):
+    def __init__(self, func_name, args, n_strips, png, what, dpi=300):
         import pickle, tempfile
         self._png = png
+        self._dpi = dpi
         self._tmpdir = tempfile.mkdtemp(prefix='ks_strips_')
         args_path = os.path.join(self._tmpdir, 'args.pkl')
         with open(args_path, 'wb') as f:
             pickle.dump(args, f)
         self._strips = [os.path.join(self._tmpdir, f'strip_{k}.npy')
                         for k in range(n_strips)]
-        self._procs = [
-            _BackgroundPlots(func_name, None, what, args_path=args_path,
-                             call_args=(k, n_strips, self._strips[k]))
-            for k in range(n_strips)
-            ]
+        self._procs = []
+        try:
+            for k in range(n_strips):
+                self._procs.append(_BackgroundPlots(
+                    func_name, None, what, args_path=args_path,
+                    call_args=(k, n_strips, self._strips[k])))
+        except BaseException:
+            self.cancel()
+            raise
 
     def wait(self):
-        import shutil
         from matplotlib import image
         try:
+            # Wait for all processes before raising, so that none of them
+            # still has a file open when the temporary folder is removed.
             errors = []
             for p in self._procs:
                 try:
@@ -433,13 +454,12 @@ class _BackgroundStrips:
                 self._strips = []
                 # Same call as savefig's png writer, so the file is the same.
                 image.imsave(self._png, np.concatenate(strips, axis=1), format='png',
-                             origin='upper', dpi=300)
+                             origin='upper', dpi=self._dpi)
         finally:
-            if self._tmpdir is not None:
-                shutil.rmtree(self._tmpdir, ignore_errors=True)
-                self._tmpdir = None
+            self.cancel()
 
     def cancel(self):
+        """Stop the processes still running and remove the temporary files."""
         import shutil
         for p in self._procs:
             p.cancel()
@@ -471,68 +491,31 @@ class BackgroundSpikePositions:
 
     def __init__(self, clu, is_refractory, positions, results_dir,
                  n_strips=None):
-        import pickle, tempfile
         from pathlib import Path
-        self._results_dir = Path(results_dir)
+        results_dir = Path(results_dir)
         if n_strips is None:
             n_strips = 1 if len(clu) < 300_000 else min(
                 12 if len(clu) > 3_000_000 else 6, os.cpu_count() or 1)
-        self._tmpdir = None
         if n_strips <= 1:
-            self._procs = [_BackgroundPlots(
+            self._plots = _BackgroundPlots(
                 '_spike_positions_from_file',
-                (clu, is_refractory, positions, self._results_dir),
+                (clu, is_refractory, positions, results_dir),
                 'Spike position plot'
-                )]
-            return
-        self._tmpdir = tempfile.mkdtemp(prefix='ks_positions_')
-        args_path = os.path.join(self._tmpdir, 'args.pkl')
-        with open(args_path, 'wb') as f:
-            pickle.dump((clu, is_refractory, positions), f)
-        self._strips = [os.path.join(self._tmpdir, f'strip_{k}.npy')
-                        for k in range(n_strips)]
-        self._procs = [
-            _BackgroundPlots('_spike_positions_strip_from_file', None,
-                             'Spike position plot', args_path=args_path,
-                             call_args=(k, n_strips, self._strips[k]))
-            for k in range(n_strips)
-            ]
+                )
+        else:
+            self._plots = _BackgroundStrips(
+                '_spike_positions_strip_from_file', (clu, is_refractory, positions),
+                n_strips, results_dir / 'spike_positions.png', 'Spike position plot',
+                dpi=_POSITIONS_DPI
+                )
 
     def wait(self):
         """Wait for the plot; raise if a plotting process failed."""
-        import shutil
-        from matplotlib import image
-        try:
-            # Wait for all processes before raising, so that none of them
-            # still has a file open when the temporary folder is removed.
-            errors = []
-            for p in self._procs:
-                try:
-                    p.wait()
-                except RuntimeError as e:
-                    errors.append(e)
-            if errors:
-                raise errors[0]
-            if self._tmpdir is not None and self._strips:
-                strips = [np.load(s) for s in self._strips]
-                self._strips = []
-                # Same call as savefig's png writer, so the file is the same.
-                image.imsave(self._results_dir / 'spike_positions.png',
-                             np.concatenate(strips, axis=1), format='png',
-                             origin='upper', dpi=_POSITIONS_DPI)
-        finally:
-            if self._tmpdir is not None:
-                shutil.rmtree(self._tmpdir, ignore_errors=True)
-                self._tmpdir = None
+        self._plots.wait()
 
     def cancel(self):
         """Stop the plotting processes (e.g. after an error) and clean up."""
-        import shutil
-        for p in self._procs:
-            p.cancel()
-        if self._tmpdir is not None:
-            shutil.rmtree(self._tmpdir, ignore_errors=True)
-            self._tmpdir = None
+        self._plots.cancel()
 
 
 def _drift_plots_from_file(path):

@@ -122,7 +122,7 @@ def _similarity_device(Wall, WtW):
     return out.cpu().numpy()
 
 
-def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
+def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25, device=None):
     
     Nfilt = iclust2.max()+1
 
@@ -132,7 +132,7 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
 
     # Group spike indices by cluster once (stable sort keeps each cluster's
     # spikes in their original order) instead of scanning iclust2 per cluster.
-    order = stable_argsort(iclust2)
+    order = stable_argsort(iclust2, device)
     bounds = np.searchsorted(iclust2[order], np.arange(Nfilt + 1))
 
     def one(kk):

@@ -41,13 +41,15 @@ def fastest(feature):
     return feature not in {f.strip() for f in off.split(',')}
 
 
-def stable_argsort(a):
-    """np.argsort(a, kind='stable'), on the GPU for large integer arrays
-    (a stable sort has only one answer, so the result is the same)."""
+def stable_argsort(a, device=None):
+    """np.argsort(a, kind='stable'), on `device` for large integer arrays
+    when it is a CUDA device (a stable sort has only one answer, so the
+    result is the same). Without a device it stays on the CPU."""
     a = np.asarray(a)
-    if (a.size > 2**20 and a.dtype.kind in 'iu' and torch.cuda.is_available()
+    if (device is not None and torch.device(device).type == 'cuda'
+            and a.size > 2**20 and a.dtype.kind in 'iu'
             and fastest('gpu_argsort')):
-        t = torch.from_numpy(np.ascontiguousarray(a)).cuda()
+        t = torch.from_numpy(np.ascontiguousarray(a)).to(device)
         return torch.sort(t, stable=True).indices.cpu().numpy()
     return np.argsort(a, kind='stable')
 
