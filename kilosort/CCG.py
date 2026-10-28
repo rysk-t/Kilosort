@@ -1,3 +1,6 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 from numba import njit
 import numpy as np
 import torch
@@ -7,7 +10,7 @@ from tqdm import trange
 
 from kilosort.utils import fastest
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500):
 
     st1 = np.sort(st1)
@@ -131,12 +134,21 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
     # spikes in their original order) instead of scanning iclust2 per cluster.
     order = np.argsort(iclust2, kind='stable')
     bounds = np.searchsorted(iclust2[order], np.arange(Nfilt + 1))
-    for kk in range(Nfilt):    
+
+    def one(kk):
         st1 = st0[order[bounds[kk]:bounds[kk+1]]]
 
         if (len(st1) > 10) and ((st1.max() - st1.min()) != 0):
             is_refractory[kk], cross_refractory[kk], R12[kk] = check_CCG(
                 st1, acg_threshold=acg_threshold, ccg_threshold=ccg_threshold
                 )
+
+    if fastest('refract_threads'):
+        # compute_CCG releases the GIL; clusters are independent.
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as ex:
+            list(ex.map(one, range(Nfilt)))
+    else:
+        for kk in range(Nfilt):
+            one(kk)
 
     return is_refractory, R12
