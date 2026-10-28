@@ -197,6 +197,17 @@ def _function(src_name, name, defines=()):
     return _modules[key].get_function(name)
 
 
+def _device(t):
+    """PyTorch's and CuPy's current device set to the device of tensor t
+    (so that kernels are loaded and launched there, e.g. on cuda:1)."""
+    import contextlib
+    import cupy as cp
+    stack = contextlib.ExitStack()
+    stack.enter_context(torch.cuda.device(t.device))
+    stack.enter_context(cp.cuda.Device(t.device.index))
+    return stack
+
+
 def _stream():
     """CuPy view of PyTorch's current CUDA stream."""
     import cupy as cp
@@ -1133,9 +1144,10 @@ def assign_iclust(isub, kn, kN, ki, top, coef):
         raise ValueError('unsupported dtype for fused assign_iclust')
     isub, kn, kN, ki, top = (t.contiguous() for t in (isub, kn, kN, ki, top))
     out = torch.empty(n, dtype=torch.int64, device=kn.device)
-    f = _function('assign', 'assign_iclust_kernel', (('K', K),))
+    with _device(kn):
+        f = _function('assign', 'assign_iclust_kernel', (('K', K),))
     tpb = 256
-    with _stream():
+    with _device(kn), _stream():
         f(((n + tpb - 1) // tpb,), (tpb,),
           (_p(isub), _p(kn), _p(kN), _p(ki), _p(top), _p(out), np.int32(n), np.float32(coef)))
     return out
@@ -1184,8 +1196,9 @@ def kpp_vsum(P, csq, v0):
     P, csq, v0 = P.contiguous(), csq.contiguous(), v0.contiguous()
     nb = (n + _KPP_ROWS - 1) // _KPP_ROWS
     part = torch.empty((nb, ntry), device=P.device)
-    f = _function('kpp', 'kpp_vsum_kernel', (('ROWS', _KPP_ROWS),))
+    with _device(P):
+        f = _function('kpp', 'kpp_vsum_kernel', (('ROWS', _KPP_ROWS),))
     tpb = (ntry + 31) // 32 * 32
-    with _stream():
+    with _device(P), _stream():
         f((nb,), (tpb,), (_p(P), _p(csq), _p(v0), _p(part), np.int32(n), np.int32(ntry)))
     return part.sum(0)

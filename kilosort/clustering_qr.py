@@ -131,14 +131,15 @@ def _counts(idx, n, like):
 _assign_kernel_state = {}
 
 
-def _assign_kernel_ok():
+def _assign_kernel_ok(t):
     """Whether the CuPy kernel for assign_iclust can be used (CuPy present
     and the kernel compiles). Checked once, outside of any graph capture."""
     if 'ok' not in _assign_kernel_state:
         ok = fused_kernels.enabled()
         if ok:
             try:
-                fused_kernels._function('assign', 'assign_iclust_kernel', (('K', 10),))
+                with fused_kernels._device(t):
+                    fused_kernels._function('assign', 'assign_iclust_kernel', (('K', 10),))
             except Exception as e:
                 logger.info(f'assign_iclust kernel unavailable ({e!r}); using PyTorch.')
                 ok = False
@@ -146,14 +147,15 @@ def _assign_kernel_ok():
     return _assign_kernel_state['ok']
 
 
-def _kpp_kernel_ok():
+def _kpp_kernel_ok(t):
     """Whether the CuPy kernel for kmeans_plusplus can be used."""
     if 'kpp' not in _assign_kernel_state:
         ok = fused_kernels.enabled()
         if ok:
             try:
-                fused_kernels._function('kpp', 'kpp_vsum_kernel',
-                                        (('ROWS', fused_kernels._KPP_ROWS),))
+                with fused_kernels._device(t):
+                    fused_kernels._function('kpp', 'kpp_vsum_kernel',
+                                            (('ROWS', fused_kernels._KPP_ROWS),))
             except Exception as e:
                 logger.info(f'kmeans_plusplus kernel unavailable ({e!r}); using PyTorch.')
                 ok = False
@@ -173,7 +175,7 @@ def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
     """
     K = kn.shape[1]
     kN = _counts(isub, nclust, tones2)[0]
-    if kn.is_cuda and _assign_kernel_ok() and fastest('assign_kernel'):
+    if kn.is_cuda and _assign_kernel_ok(kn) and fastest('assign_kernel'):
         top = torch.sort(kN, stable=True).indices[:K+1]
         return fused_kernels.assign_iclust(isub, kn, kN, ki, top, lam/m)
     L = isub[kn]                                   # (n_spikes, n_neigh)
@@ -454,7 +456,7 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     jt = torch.zeros((), dtype=torch.int, device=device)
     # Fused column sums (CuPy) instead of the (n_spikes, ntry) temporaries;
     # 2 * Xg is computed once (the same values as in every iteration).
-    fused = Xg.is_cuda and fastest('kpp_kernel') and _kpp_kernel_ok()
+    fused = Xg.is_cuda and fastest('kpp_kernel') and _kpp_kernel_ok(Xg)
     if fused:
         Xg2 = 2 * Xg
 

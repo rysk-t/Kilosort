@@ -43,6 +43,9 @@ def check_split(Xd, kk, xtree, iclust, my_clus, ix1=None, ix2=None):
     score = bimod_score(xproj)
     return xproj, score
 
+_SPLIT_CHUNK = 2**17
+
+
 def check_split_device(Xg, ix1, ix2):
     """`check_split` (with ix1, ix2) on the device of Xg, the features of
     the same spikes as Xd. Same float64 arithmetic, so only the order of the
@@ -50,18 +53,28 @@ def check_split_device(Xg, ix1, ix2):
     ixy = ix1 | ix2
     sel = torch.from_numpy(np.nonzero(ixy)[0]).to(Xg.device)
     labels = torch.from_numpy(2*ix1[ixy] - 1).to(Xg.device, torch.float64)
-    Xs = Xg.index_select(0, sel).double()
-    Xs[:,-1] = 1
-
     npos = (labels > 0).double().mean()
     nneg = (labels < 0).double().mean()
     w = torch.where(labels > 0, nneg, npos).unsqueeze(1)
 
-    Xw = Xs * w
-    CC = Xs.T @ Xw
+    # The float64 copies of the spikes are made in chunks of rows, so that
+    # the memory stays bounded for very large clusters.
+    def rows(s):
+        Xs = Xg.index_select(0, sel[s:s+_SPLIT_CHUNK]).double()
+        Xs[:,-1] = 1
+        return Xs
+
+    nf = Xg.shape[1]
+    CC = torch.zeros((nf, nf), dtype=torch.float64, device=Xg.device)
+    rhs = torch.zeros(nf, dtype=torch.float64, device=Xg.device)
+    for s in range(0, len(sel), _SPLIT_CHUNK):
+        Xs = rows(s)
+        Xw = Xs * w[s:s+_SPLIT_CHUNK]
+        CC += Xs.T @ Xw
+        rhs += labels[s:s+_SPLIT_CHUNK] @ Xw
     CC = CC + .01 * torch.eye(CC.shape[0], dtype=CC.dtype, device=CC.device)
-    b = torch.linalg.solve(CC, labels @ Xw)
-    xproj = (Xs @ b).cpu().numpy()
+    b = torch.linalg.solve(CC, rhs)
+    xproj = torch.cat([rows(s) @ b for s in range(0, len(sel), _SPLIT_CHUNK)]).cpu().numpy()
 
     score = bimod_score(xproj)
     return xproj, score
