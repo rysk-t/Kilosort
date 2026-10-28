@@ -1019,6 +1019,50 @@ def _fastest(feature):
     return fastest(feature)
 
 
+_BLOCK_GS = 64
+_block_cache = {}
+
+
+def _block_plan(U):
+    """Templates of U (n_templates, n_pcs, n_chans) sorted by their nonzero
+    channels and cut into groups of _BLOCK_GS; each group's channel range and
+    its coefficients as a (group size, range * n_pcs) matrix. Cached like
+    _template_sparsity (U is the same tensor for all batches)."""
+    hit = _block_cache.get('hit')
+    if hit is not None and hit[0]() is U and hit[1] == U._version:
+        return hit[2]
+    C = U.shape[2]
+    nz = (U != 0).any(1)
+    ar = torch.arange(C, device=U.device)
+    c0 = torch.where(nz, ar, C).min(1).values
+    c1 = torch.where(nz, ar, -1).max(1).values
+    order = torch.argsort(c0 * C + c1)
+    lo = c0[order].cpu().numpy()
+    hi = c1[order].cpu().numpy() + 1
+    plan = []
+    for s in range(0, U.shape[0], _BLOCK_GS):
+        a, b = int(lo[s:s+_BLOCK_GS].min()), int(hi[s:s+_BLOCK_GS].max())
+        if b <= a:
+            a, b = 0, 1        # all-zero templates
+        idx = order[s:s+_BLOCK_GS]
+        Ug = U[idx][:, :, a:b].permute(0, 2, 1).reshape(len(idx), -1).contiguous()
+        plan.append((idx, a, b, Ug))
+    _block_cache['hit'] = (weakref.ref(U), U._version, plan)
+    return plan
+
+
+def _block_product(U, conv):
+    """U.reshape(NU, -1) @ conv for the PC projections conv (n_chans, n_pcs,
+    NT), skipping the channels where a group of templates is zero: about 4x
+    fewer operations for local templates. Sums the same nonzero terms, in a
+    different order (rounding only)."""
+    NT = conv.shape[-1]
+    B = torch.empty((U.shape[0], NT), device=conv.device)
+    for idx, a, b, Ug in _block_plan(U):
+        B[idx] = Ug @ conv[a:b].reshape(-1, NT)
+    return B
+
+
 def _template_groups_rm(U, ctc, rows, row0, GS):
     """For each template y, the first and last group of GS rows that contain
     a row of B changed by y's spikes (the nonzero rows of ctc[:, y]), cached
@@ -1100,9 +1144,13 @@ def run_matching(ops, X, U, ctc, device=torch.device('cuda')):
     # einsum('ijk, kjl -> il', U, conv1d(X, W)) permutes the conv output to
     # (j, k, l) and runs this matmul; producing it in that layout directly
     # saves the copy and rounds the same way.
-    B = conv1d_templates(X, W, nt//2, kmajor=True)
     NU = U.shape[0]
-    B = U.reshape(NU, -1) @ B.reshape(-1, B.shape[-1])
+    if _fastest('bsparse') and U.dim() == 3:
+        # Only the channel range of each group of templates (fastest).
+        B = _block_product(U, conv1d_templates(X, W, nt//2, kmajor=False))
+    else:
+        B = conv1d_templates(X, W, nt//2, kmajor=True)
+        B = U.reshape(NU, -1) @ B.reshape(-1, B.shape[-1])
 
     capacity = 100000
     st = torch.zeros((capacity,2), dtype = torch.int64, device = device)

@@ -44,14 +44,34 @@ def _fast_fft_length(n):
     return best
 
 
+# Number of batches read ahead (and threads reading them) with the
+# `prefetch_depth` feature; 1 without it.
+_PREFETCH_DEPTH = 3
+
+
+def _prefetch_depth():
+    return _PREFETCH_DEPTH if fastest('prefetch_depth') else 1
+
+
 def _prefetch_pool():
-    """Single background thread used to read the next batch from disk."""
+    """Background threads used to read the next batches from disk."""
     global _prefetch_executor
     if _prefetch_executor is None:
         _prefetch_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix='kilosort-prefetch'
+            max_workers=_PREFETCH_DEPTH, thread_name_prefix='kilosort-prefetch'
             )
     return _prefetch_executor
+
+
+_h2d_streams = {}
+
+
+def _h2d_stream(device):
+    """Side CUDA stream (per device) for copies made by the prefetch threads."""
+    key = torch.device(device)
+    if key not in _h2d_streams:
+        _h2d_streams[key] = torch.cuda.Stream(device=key)
+    return _h2d_streams[key]
 
 
 def find_binary(data_dir: Union[str, os.PathLike]) -> Path:
@@ -428,12 +448,16 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
                     reset=True)
 
     # contamination ratio
+    # Large integer sorts may run on the GPU that was used for sorting (Wall
+    # is on the CPU by now, wPCA is still on that device).
+    wPCA = ops.get('wPCA')
+    sort_device = wPCA.device if torch.is_tensor(wPCA) else None
     acg_threshold = ops['settings']['acg_threshold']
     ccg_threshold = ops['settings']['ccg_threshold']
     is_ref, est_contam_rate = CCG.refract(spike_clusters, spike_times / ops['fs'],
                                           acg_threshold=acg_threshold,
                                           ccg_threshold=ccg_threshold,
-                                          device=Wall.device)
+                                          device=sort_device)
     log_performance(logger, level='debug', header='save_to_phy, est contam',
                     reset=True)
     if on_refract is not None:
@@ -459,7 +483,7 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # so the extra memory hopefully won't be an issue.
     tF = tF[kept_spikes]
     pc_features, pc_feature_ind = make_pc_features(
-        ops, spike_templates, spike_clusters, tF, device=Wall.device
+        ops, spike_templates, spike_clusters, tF, device=sort_device
         )
     if fastest('mmap_save'):
         _save_mapped(results_dir / 'pc_features.npy', pc_features)
@@ -880,30 +904,56 @@ class BinaryRWFile:
                 got += n
         return buf, bstart, bend
 
-    def _prefetched_batch(self, ibatch):
-        """Return the raw batch `ibatch` and start reading the next one.
+    def _read_ahead(self, ibatch):
+        """`_read_raw_batch` for the prefetch threads. With the `h2d_overlap`
+        feature the batch is also copied to the GPU there, on a side stream,
+        so the copy overlaps with the computations on the previous batch."""
+        buf, bstart, bend = self._read_raw_batch(ibatch)
+        if not fastest('h2d_overlap'):
+            return buf, None, bstart, bend
+        stream = _h2d_stream(self.device)
+        with torch.cuda.device(self.device), torch.cuda.stream(stream):
+            data = buf.to(self.device, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(stream)
+        return data, done, bstart, bend
 
-        The next batch is guessed from the stride between the last two calls,
-        which covers the sequential passes over the data. A wrong guess only
-        costs one wasted read.
+    def _prefetched_batch(self, ibatch):
+        """Return the raw batch `ibatch` and start reading the next ones.
+
+        The next batches are guessed from the stride between the last two
+        calls, which covers the sequential passes over the data. A wrong guess
+        only costs wasted reads. The batch is pinned host memory, or already
+        on the GPU (see `_read_ahead`).
         """
         pf = self.__dict__.setdefault('_prefetch', {})
-        fut = pf.pop('future', None)
-        if fut is not None and pf.get('key') == ibatch:
-            buf, bstart, bend = fut.result()
+        pending = pf.setdefault('futures', {})
+        fut = pending.pop(ibatch, None)
+        if fut is not None:
+            data, done, bstart, bend = fut.result()
+            if done is not None:
+                # Wait (on the GPU) for the copy, and keep the memory from
+                # being reused before this stream is done with it.
+                stream = torch.cuda.current_stream(self.device)
+                stream.wait_event(done)
+                data.record_stream(stream)
         else:
-            buf, bstart, bend = self._read_raw_batch(ibatch)
+            data, bstart, bend = self._read_raw_batch(ibatch)
 
         step = ibatch - pf.get('last', ibatch - self.batch_downsampling)
         if step <= 0:
             # e.g. the start of a new pass over the data
             step = self.batch_downsampling
         pf['last'] = ibatch
-        nxt = ibatch + step
-        if nxt // self.batch_downsampling < self.n_batches:
-            pf['key'] = nxt
-            pf['future'] = _prefetch_pool().submit(self._read_raw_batch, nxt)
-        return buf, bstart, bend
+        ahead = [ibatch + k*step for k in range(1, _prefetch_depth() + 1)]
+        ahead = [b for b in ahead if b // self.batch_downsampling < self.n_batches]
+        for b in list(pending):
+            if b not in ahead:
+                del pending[b]      # wrong guess, e.g. a new pass
+        for b in ahead:
+            if b not in pending:
+                pending[b] = _prefetch_pool().submit(self._read_ahead, b)
+        return data, bstart, bend
 
     def padded_batch_to_torch(self, ibatch, return_inds=False):
         """ read batches from file """

@@ -7,7 +7,7 @@ from tqdm import tqdm
 
 from kilosort import CCG, fused_kernels
 from kilosort.spikedetect import grow_buffer
-from kilosort.utils import log_performance, stable_argsort
+from kilosort.utils import log_performance, fastest, stable_argsort
 
 logger = logging.getLogger(__name__)
 
@@ -150,9 +150,10 @@ def align_U(U, ops, device=torch.device('cuda')):
 def postprocess_templates(Wall, ops, clu, st, tF, device=torch.device('cuda')):
     Wall2, _ = align_U(Wall, ops, device=device)
     #Wall3, _= remove_duplicates(ops, Wall2)
+    # Only the templates are used, so the features aren't reordered.
     Wall3, _, _, _, _ = merging_function(
         ops, Wall2.transpose(1,2), clu, st, tF,
-        0.9, 'mu', check_dt=False, device=device
+        0.9, 'mu', check_dt=False, device=device, sort_features=False
         )
     Wall3 = Wall3.transpose(1,2).to(device)
     return Wall3
@@ -193,9 +194,14 @@ def _run_matching_torch(ops, X, U, ctc, device=torch.device('cuda')):
     #U2 = U / mu.unsqueeze(-1).unsqueeze(-1)
 
     B = conv1d(X.unsqueeze(1), W.unsqueeze(1), padding=nt//2)
-    B = torch.einsum('ijk, kjl -> il', U, B)
+    if device.type == 'cuda' and fastest('bsparse'):
+        # Same block product as fused_kernels.run_matching, which is checked
+        # against this function bit for bit.
+        B = fused_kernels._block_product(U, B)
+    else:
+        B = torch.einsum('ijk, kjl -> il', U, B)
 
-    trange = torch.arange(-nt, nt+1, device=device) 
+    trange = torch.arange(-nt, nt+1, device=device)
     tiwave = torch.arange(-(nt//2), nt//2+1, device=device) 
 
     st = torch.zeros((100000,2), dtype = torch.int64, device = device)
@@ -260,7 +266,9 @@ def _run_matching_torch(ops, X, U, ctc, device=torch.device('cuda')):
 
 
 def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=True,
-                     device=torch.device('cuda')):
+                     device=torch.device('cuda'), sort_features=True):
+    # sort_features=False: tF is returned as None instead of in the order of
+    # the sorted spikes (for callers that don't use it).
     clu2 = clu.copy()
     clu_unq, ns = np.unique(clu2, return_counts = True)
 
@@ -379,8 +387,11 @@ def merging_function(ops, Wall, clu, st, tF, r_thresh=0.5, mode='ccg', check_dt=
     sorted_idx = np.argsort(st[:,0])
     st = np.take_along_axis(st, sorted_idx[..., np.newaxis], axis=0)
     clu2 = clu2[sorted_idx]
-    tensor_idx = torch.from_numpy(sorted_idx)
-    tF = tF[tensor_idx]
+    if sort_features or not fastest('skip_tf_sort'):
+        tensor_idx = torch.from_numpy(sorted_idx)
+        tF = tF[tensor_idx]
+    else:
+        tF = None
 
     return Ww.cpu(), clu2, is_ref, st, tF
 

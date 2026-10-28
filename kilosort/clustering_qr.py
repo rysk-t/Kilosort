@@ -274,8 +274,12 @@ _graph_cleanup_limits = {}
 _graph_pool_lock = Lock()
 
 
-def _replay_graph(step, n, device):
+def _replay_graph(step, n, device, done=None, every=4):
     """Record one call of `step` as a CUDA graph and replay it `n` times.
+
+    With `done` (a callable returning True once further replays can't change
+    the state), the replays stop early: `done` is checked every `every`
+    replays (each check waits for the GPU).
 
     The clustering loops launch many tiny kernels per iteration, so their
     runtime is dominated by launch overhead. Recording does not execute
@@ -303,8 +307,10 @@ def _replay_graph(step, n, device):
                 step()
             finally:
                 g.capture_end()
-        for _ in range(n):
+        for i in range(n):
             g.replay()
+            if done is not None and (i + 1) % every == 0 and i + 1 < n and done():
+                break
         # Finish before releasing the previous graph or reusing its pool.
         torch.cuda.current_stream(device).synchronize()
         _graph_pools[device] = (g, capture_stream)
@@ -382,14 +388,21 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
         if device.type == 'cuda' and t == _N_EAGER:
             # Replay the remaining iterations from a CUDA graph.
             static_iclust = iclust.clone()
+            # An iteration that leaves iclust unchanged is a fixed point (isub
+            # and the next iclust only depend on iclust), so all later
+            # iterations give the same result and can be skipped (fastest).
+            changed = torch.ones((), dtype=torch.bool, device=device)
             def step():
                 isub = assign_isub(static_iclust, kn, tones2, nclust, nsub, lam,
                                    m, ki, kj, device=device)
-                static_iclust.copy_(assign_iclust(
+                new = assign_iclust(
                     rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj,
                     device=device
-                    ))
-            _replay_graph(step, niter - t, static_iclust.device)
+                    )
+                changed.copy_((new != static_iclust).any())
+                static_iclust.copy_(new)
+            done = (lambda: not bool(changed)) if fastest('early_stop') else None
+            _replay_graph(step, niter - t, static_iclust.device, done=done)
             iclust = static_iclust
             break
         # given iclust, reassign isub
