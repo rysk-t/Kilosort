@@ -379,11 +379,39 @@ extern "C" __global__ void pursuit_em(
         }
     }
 }
+extern "C" __global__ void pursuit_covariance(
+        const double* clp, const double* weights, const long long* lengths,
+        double* matrix, int maximum, int dim) {
+    int tile_row=blockIdx.y, tile_col=blockIdx.x, b=blockIdx.z;
+    if (tile_col<tile_row) return;
+    int tx=threadIdx.x, ty=threadIdx.y, row=tile_row*16+ty, col=tile_col*16+tx;
+    int n=lengths[b];
+    __shared__ double left[16][16], right[16][16];
+    const double *data=clp+(long long)b*maximum*dim, *wb=weights+(long long)b*maximum;
+    double total=0;
+    for (int k=0; k<n; k+=16) {
+        int sample=k+ty, channel=tile_row*16+tx;
+        left[ty][tx]=(sample<n && channel<dim) ? data[(long long)sample*dim+channel] : 0;
+        right[ty][tx]=(sample<n && col<dim) ? data[(long long)sample*dim+col]*wb[sample] : 0;
+        __syncthreads();
+        #pragma unroll
+        for (int j=0; j<16; ++j) total=__fma_rn(left[j][ty],right[j][tx],total);
+        __syncthreads();
+    }
+    if (row<dim && col<dim && row<=col) matrix[(long long)b*dim*dim+row*dim+col]=total;
+}
 extern "C" __global__ void pursuit_prepare(
-        double* matrix, double* rhs, const long long* lengths, const bool* alive, int dim) {
+        double* matrix, double* rhs, const long long* lengths, const bool* alive, int dim, int triangle) {
     int b=blockIdx.x;
-    for (int i=threadIdx.x; i<dim*dim; i+=256)
-        matrix[(long long)b*dim*dim+i]=alive[b] ? matrix[(long long)b*dim*dim+i]/lengths[b] : (i/dim==i%dim);
+    double* mat=matrix+(long long)b*dim*dim;
+    for (int i=threadIdx.x; i<dim*dim; i+=256) {
+        if (!alive[b]) mat[i]=(i/dim==i%dim);
+        else if (!triangle || i/dim<=i%dim) mat[i]/=lengths[b];
+    }
+    __syncthreads();
+    if (triangle && alive[b])
+        for (int i=threadIdx.x; i<dim*dim; i+=256)
+            if (i/dim>i%dim) mat[i]=mat[(i%dim)*dim+i/dim];
     for (int i=threadIdx.x; i<dim; i+=256)
         rhs[b*dim+i]=alive[b] ? rhs[b*dim+i]/lengths[b] : 0;
 }
@@ -413,7 +441,7 @@ def _pursuit_cuda_module(device_index):
     with cp.cuda.Device(device_index):
         module = cp.RawModule(code=_PURSUIT_CUDA, options=('--fmad=false',))
         return tuple(module.get_function(name) for name in
-                     ('pursuit_em', 'pursuit_prepare', 'pursuit_normalize'))
+                     ('pursuit_em', 'pursuit_prepare', 'pursuit_normalize', 'pursuit_covariance'))
 
 
 def _pursuit_cuda_iterations(clp, x, means, variances, p, n, alive):
@@ -426,16 +454,23 @@ def _pursuit_cuda_iterations(clp, x, means, variances, p, n, alive):
     weights, target = clp.new_zeros((count, maximum)), clp.new_zeros((count, maximum))
     fallback = torch.zeros_like(alive)
     transpose = clp.transpose(1, 2)
+    fused_covariance = fastest('ks25_split_cov_fused')
     with _device(clp), _stream():
-        em, prepare, normalize = _pursuit_cuda_module(clp.device.index)
+        em, prepare, normalize, covariance = _pursuit_cuda_module(clp.device.index)
         for iteration in range(1, 51):
             update = iteration > 10 and iteration % 2
             em((count,), (256,), (_p(x), _p(lengths), _p(model), _p(alive), _p(rs),
                                   _p(weights), _p(target), np.int32(maximum), np.int32(update)))
             if update:
-                matrix = torch.bmm(transpose, clp * weights[:, :, None])
+                if fused_covariance:
+                    matrix = clp.new_empty((count, dim, dim))
+                    tiles = (dim + 15) // 16
+                    covariance((tiles, tiles, count), (16, 16),
+                               (_p(clp), _p(weights), _p(lengths), _p(matrix), np.int32(maximum), np.int32(dim)))
+                else:
+                    matrix = torch.bmm(transpose, clp * weights[:, :, None])
                 rhs = torch.bmm(transpose, target[:, :, None])
-                prepare((count,), (256,), (_p(matrix), _p(rhs), _p(lengths), _p(alive), np.int32(dim)))
+                prepare((count,), (256,), (_p(matrix), _p(rhs), _p(lengths), _p(alive), np.int32(dim), np.int32(fused_covariance)))
                 lower, info = torch.linalg.cholesky_ex(matrix, check_errors=False)
                 y = torch.linalg.solve_triangular(lower, rhs, upper=False)
                 w = torch.linalg.solve_triangular(lower.transpose(1, 2), y, upper=True)

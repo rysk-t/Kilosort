@@ -5,6 +5,9 @@ highpass_cutoff, whitening_range, nskip, ...) come from
 `kilosort.parameters.DEFAULT_SETTINGS`."""
 
 DEFAULT_SETTINGS25 = {
+    # 'matlab': the values below (Kilosort 2.5 defaults). 'tuned': the
+    # values of TUNED_SETTINGS25 (better on the sim_med_drift benchmark).
+    'preset': 'matlab',
     # configFile384.m
     'Th': (10.0, 4.0),       # threshold on projections [learning, final pass]
     'lam': 10.0,             # amplitude penalty
@@ -31,4 +34,16 @@ DEFAULT_SETTINGS25 = {
     'fix_split_swap': True,    # splitAllClusters assigns c1/c2 to the wrong half
     'fix_merge_pc': True,      # find_merges does not remap the PC feature channels
     'matlab_tail': False,      # True: skip the last ~Nthreads samples of a batch like the CUDA loops
+}
+
+
+# Measured on the first 600 s of the sim_med_drift simulation (2026-10-29):
+# the MATLAB defaults find 441 of 600 ground-truth units in 60 s, these
+# settings 508 in 69 s (Kilosort 4: 512 in 46 s). Lower thresholds catch the
+# small units the defaults never build templates for; the shorter momentum
+# lets the templates follow the drift. Th=(6,3), momentum=(20,200) reaches
+# 517 in 92 s.
+TUNED_SETTINGS25 = {
+    'Th': (8.0, 4.0),
+    'momentum': (20.0, 100.0),
 }

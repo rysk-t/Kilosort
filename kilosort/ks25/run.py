@@ -24,7 +24,7 @@ from kilosort.run_kilosort import (
 from kilosort.utils import log_performance, get_performance, ops_as_string
 import kilosort.plots as kplots
 
-from kilosort.ks25.params import DEFAULT_SETTINGS25
+from kilosort.ks25.params import DEFAULT_SETTINGS25, TUNED_SETTINGS25
 from kilosort.ks25 import learn, postprocess
 
 logger = logging.getLogger(__name__)
@@ -35,6 +35,8 @@ def split_settings(settings):
     Kilosort 2.5 settings (`DEFAULT_SETTINGS25`), each with their defaults."""
     settings = dict(settings)
     s25 = dict(DEFAULT_SETTINGS25)
+    if settings.get('preset', s25['preset']) == 'tuned':
+        s25.update(TUNED_SETTINGS25)
     for k in DEFAULT_SETTINGS25:
         if k in settings:
             s25[k] = settings.pop(k)
