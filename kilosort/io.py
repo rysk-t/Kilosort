@@ -11,16 +11,67 @@ logger = logging.getLogger(__name__)
 from scipy.io import loadmat
 import numpy as np
 import torch
-from torch.fft import fft, ifft, fftshift
+from torch.fft import fft, ifft, fftshift, rfft, irfft
 
-from kilosort import CCG
+from kilosort import CCG, fused_kernels
+from kilosort.fused_preprocessing import load_batch, subtract_mean_and_median
 from kilosort.preprocessing import get_drift_matrix, fft_highpass
 from kilosort.postprocessing import (
     remove_duplicates, compute_spike_positions, make_pc_features
     )
-from kilosort.utils import log_performance
+from kilosort.utils import log_performance, fastest
 
 _torch_warning = ".*PyTorch does not support non-writable tensors"
+_prefetch_executor = None
+
+
+def fast_approx():
+    """True if KILOSORT_FAST_APPROX=1: allow faster computations whose
+    results differ slightly from the default ones (not bit-identical)."""
+    return os.environ.get('KILOSORT_FAST_APPROX', '0') == '1'
+
+
+def _fast_fft_length(n):
+    """Smallest 2**a * 3**b >= n."""
+    best = 1 << (n - 1).bit_length()
+    p3 = 1
+    while p3 < best:
+        m = p3
+        while m < n:
+            m *= 2
+        best = min(best, m)
+        p3 *= 3
+    return best
+
+
+# Number of batches read ahead (and threads reading them) with the
+# `prefetch_depth` feature; 1 without it.
+_PREFETCH_DEPTH = 3
+
+
+def _prefetch_depth():
+    return _PREFETCH_DEPTH if fastest('prefetch_depth') else 1
+
+
+def _prefetch_pool():
+    """Background threads used to read the next batches from disk."""
+    global _prefetch_executor
+    if _prefetch_executor is None:
+        _prefetch_executor = ThreadPoolExecutor(
+            max_workers=_PREFETCH_DEPTH, thread_name_prefix='kilosort-prefetch'
+            )
+    return _prefetch_executor
+
+
+_h2d_streams = {}
+
+
+def _h2d_stream(device):
+    """Side CUDA stream (per device) for copies made by the prefetch threads."""
+    key = torch.device(device)
+    if key not in _h2d_streams:
+        _h2d_streams[key] = torch.cuda.Stream(device=key)
+    return _h2d_streams[key]
 
 
 def find_binary(data_dir: Union[str, os.PathLike]) -> Path:
@@ -245,9 +296,27 @@ def select_shank(probe, shank_idx):
     return probe
 
 
+def _save_mapped(path, arr):
+    """np.save through a memory-mapped .npy file (same file contents).
+
+    The copy goes to the page cache and Windows writes it back lazily,
+    instead of np.save's buffered writes of a strided array, which wait for
+    the disk (~20 s for the 3 GB pc_features of a 45 min Neuropixels run).
+    """
+    if torch.is_tensor(arr):
+        arr = arr.numpy()
+    path = Path(path)
+    if path.exists():
+        path.unlink()
+    m = np.lib.format.open_memmap(path, mode='w+', dtype=arr.dtype, shape=arr.shape)
+    m[...] = arr
+    del m
+
+
 def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
                 data_dtype=None, save_extra_vars=False,
-                save_preprocessed_copy=False, skip_dat_path=False):
+                save_preprocessed_copy=False, skip_dat_path=False,
+                on_refract=None):
     """Save sorting results to disk in a format readable by Phy.
 
     Parameters
@@ -289,8 +358,13 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
         has an unexpected format, like when using a `file_object` loaded from
         an external data format through SpikeInterface. The full filename(s) will
         still be included in `params.py` for reference, but will be commented out.
+    on_refract : callable; optional.
+        Called as `on_refract(spike_clusters, is_ref, spike_positions)` (all
+        after duplicate removal) as soon as the refractory labels are known,
+        before the slower template and PC feature exports. Used to start the
+        spike position plot early.
 
-    
+
     Returns
     -------
     results_dir : pathlib.Path.
@@ -373,6 +447,22 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     log_performance(logger, level='debug', header='save_to_phy, remove duplicates',
                     reset=True)
 
+    # contamination ratio
+    # Large integer sorts may run on the GPU that was used for sorting (Wall
+    # is on the CPU by now, wPCA is still on that device).
+    wPCA = ops.get('wPCA')
+    sort_device = wPCA.device if torch.is_tensor(wPCA) else None
+    acg_threshold = ops['settings']['acg_threshold']
+    ccg_threshold = ops['settings']['ccg_threshold']
+    is_ref, est_contam_rate = CCG.refract(spike_clusters, spike_times / ops['fs'],
+                                          acg_threshold=acg_threshold,
+                                          ccg_threshold=ccg_threshold,
+                                          device=sort_device)
+    log_performance(logger, level='debug', header='save_to_phy, est contam',
+                    reset=True)
+    if on_refract is not None:
+        on_refract(spike_clusters, is_ref, spike_positions)
+
     # template properties
     similar_templates = CCG.similarity(Wall, ops['wPCA'].contiguous(), nt=ops['nt'])
     template_amplitudes = torch.norm(Wall, dim=[-2,-1]).cpu().numpy()
@@ -393,20 +483,14 @@ def save_to_phy(st, clu, tF, Wall, probe, ops, imin, results_dir=None,
     # so the extra memory hopefully won't be an issue.
     tF = tF[kept_spikes]
     pc_features, pc_feature_ind = make_pc_features(
-        ops, spike_templates, spike_clusters, tF
+        ops, spike_templates, spike_clusters, tF, device=sort_device
         )
-    np.save(results_dir / 'pc_features.npy', pc_features)
+    if fastest('mmap_save'):
+        _save_mapped(results_dir / 'pc_features.npy', pc_features)
+    else:
+        np.save(results_dir / 'pc_features.npy', pc_features)
     np.save(results_dir / 'pc_feature_ind.npy', pc_feature_ind)
     log_performance(logger, level='debug', header='save_to_phy, pc features',
-                    reset=True)
-
-    # contamination ratio
-    acg_threshold = ops['settings']['acg_threshold']
-    ccg_threshold = ops['settings']['ccg_threshold']
-    is_ref, est_contam_rate = CCG.refract(spike_clusters, spike_times / ops['fs'],
-                                          acg_threshold=acg_threshold,
-                                          ccg_threshold=ccg_threshold)
-    log_performance(logger, level='debug', header='save_to_phy, est contam',
                     reset=True)
 
     # write properties to *.tsv
@@ -786,43 +870,140 @@ class BinaryRWFile:
         self.batch_downsampling = downsampling
         self.n_batches = np.int64(self.n_batches_raw / self.batch_downsampling)
 
+    def _can_prefetch(self):
+        # Only plain int16 reads from our own (read-only) memmap are prefetched,
+        # so the background read can't race with writes or with an arbitrary
+        # user-supplied file object.
+        return (str(self.dtype) == 'int16' and self.scale is None
+                and self.shift is None and self.file_object is None
+                and not self.writable and self.device.type == 'cuda')
+
+    def _read_raw_batch(self, ibatch):
+        """Read the raw int16 samples for `ibatch` into pinned host memory.
+
+        The bytes are read from the file straight into the pinned buffer with
+        unbuffered reads: the same data as slicing the memmap, but without
+        a page fault per 4 kB (1.5 -> 2.5 GB/s from an NVMe drive on Windows,
+        which matters once the recording no longer fits in the page cache).
+        """
+        bstart, bend = self._get_batch_edges(ibatch)
+        # Like the memmap slice this replaces, stop at the end of the file
+        # (the first batch of a recording shorter than NT + nt).
+        nsamp = int(min(bend, self.total_samples) - bstart)
+        buf = torch.empty((nsamp, self.n_chan_bin), dtype=torch.int16,
+                          pin_memory=True)
+        f = self.filename[0] if isinstance(self.filename, list) else self.filename
+        view = memoryview(buf.numpy()).cast('B')
+        with open(f, 'rb', buffering=0) as fh:
+            fh.seek(int(bstart) * self.n_chan_bin * buf.element_size())
+            got = 0
+            while got < len(view):
+                n = fh.readinto(view[got:])
+                if not n:
+                    raise EOFError(f'{f} ended while reading batch {ibatch}')
+                got += n
+        return buf, bstart, bend
+
+    def _read_ahead(self, ibatch):
+        """`_read_raw_batch` for the prefetch threads. With the `h2d_overlap`
+        feature the batch is also copied to the GPU there, on a side stream,
+        so the copy overlaps with the computations on the previous batch."""
+        buf, bstart, bend = self._read_raw_batch(ibatch)
+        if not fastest('h2d_overlap'):
+            return buf, None, bstart, bend
+        stream = _h2d_stream(self.device)
+        with torch.cuda.device(self.device), torch.cuda.stream(stream):
+            data = buf.to(self.device, non_blocking=True)
+            done = torch.cuda.Event()
+            done.record(stream)
+        return data, done, bstart, bend
+
+    def _prefetched_batch(self, ibatch):
+        """Return the raw batch `ibatch` and start reading the next ones.
+
+        The next batches are guessed from the stride between the last two
+        calls, which covers the sequential passes over the data. A wrong guess
+        only costs wasted reads. The batch is pinned host memory, or already
+        on the GPU (see `_read_ahead`).
+        """
+        pf = self.__dict__.setdefault('_prefetch', {})
+        pending = pf.setdefault('futures', {})
+        fut = pending.pop(ibatch, None)
+        if fut is not None:
+            data, done, bstart, bend = fut.result()
+            if done is not None:
+                # Wait (on the GPU) for the copy, and keep the memory from
+                # being reused before this stream is done with it.
+                stream = torch.cuda.current_stream(self.device)
+                stream.wait_event(done)
+                data.record_stream(stream)
+        else:
+            data, bstart, bend = self._read_raw_batch(ibatch)
+
+        step = ibatch - pf.get('last', ibatch - self.batch_downsampling)
+        if step <= 0:
+            # e.g. the start of a new pass over the data
+            step = self.batch_downsampling
+        pf['last'] = ibatch
+        ahead = [ibatch + k*step for k in range(1, _prefetch_depth() + 1)]
+        ahead = [b for b in ahead if b // self.batch_downsampling < self.n_batches]
+        for b in list(pending):
+            if b not in ahead:
+                del pending[b]      # wrong guess, e.g. a new pass
+        for b in ahead:
+            if b not in pending:
+                pending[b] = _prefetch_pool().submit(self._read_ahead, b)
+        return data, bstart, bend
+
     def padded_batch_to_torch(self, ibatch, return_inds=False):
         """ read batches from file """
         ibatch *= self.batch_downsampling
-        bstart, bend = self._get_batch_edges(ibatch)
-        data = self.file[bstart : bend]
-        data = data.T
+        prefetch = self._can_prefetch()
+        if prefetch:
+            data, bstart, bend = self._prefetched_batch(ibatch)
+            nsamp = data.shape[0]
+        else:
+            bstart, bend = self._get_batch_edges(ibatch)
+            data = self.file[bstart : bend]
+            data = data.T
 
-        if self.dtype == 'uint16':
-            # Shift data to +/- 2**15
-            data = data.astype('float32')
-            data = data - 2**15
+            if self.dtype == 'uint16':
+                # Shift data to +/- 2**15
+                data = data.astype('float32')
+                data = data - 2**15
 
-        # Typically only need to be used with float32 data
-        if self.scale is not None:
-            data = data * self.scale
-        if self.shift is not None:
-            data = data + self.shift
+            # Typically only need to be used with float32 data
+            if self.scale is not None:
+                data = data * self.scale
+            if self.shift is not None:
+                data = data + self.shift
 
-        nsamp = data.shape[-1]
+            nsamp = data.shape[-1]
         X = torch.zeros((self.n_chan_bin, self.NT + 2*self.nt), device=self.device)
 
         with warnings.catch_warnings():
             # Don't need this, we know about the warning and it doesn't cause
             # any problems. Doing this the "correct" way is much slower.
             warnings.filterwarnings("ignore", message=_torch_warning)
+            if prefetch:
+                # Transpose on the GPU rather than on the CPU. The buffer is
+                # pinned memory from PyTorch's caching host allocator, which
+                # keeps it alive until the asynchronous copy is done.
+                data = data.to(self.device, non_blocking=True).T.float()
+            else:
+                data = torch.from_numpy(data).to(self.device).float()
 
             # fix the data at the edges for the first and last batch
             if ibatch == 0:
-                X[:, self.nt : self.nt+nsamp] = torch.from_numpy(data).to(self.device).float()
+                X[:, self.nt : self.nt+nsamp] = data
                 X[:, :self.nt] = X[:, self.nt : self.nt+1]
                 bstart = self.imin - self.nt
             elif ibatch == self.n_batches-1:
-                X[:, :nsamp] = torch.from_numpy(data).to(self.device).float()
+                X[:, :nsamp] = data
                 X[:, nsamp:] = X[:, nsamp-1:nsamp]
                 bend += self.nt
             else:
-                X[:] = torch.from_numpy(data).to(self.device).float()
+                X[:] = data
 
         inds = [bstart, bend]
         if return_inds:
@@ -987,27 +1168,122 @@ class BinaryFiltered(BinaryRWFile):
         self.invert_sign=invert_sign
         self.artifact_threshold = artifact_threshold
 
-    def filter(self, X, ops=None, ibatch=None, skip_preproc=False):
-        # pick only the channels specified in the chanMap
-        if self.chan_map is not None:
-            X = X[self.chan_map]
+    def _fft_highpass(self, NT):
+        # The filter's FFT only depends on its length, so compute it once
+        # instead of once per batch.
+        cached = self.__dict__.get('_fwav')
+        if cached is None or cached[0] is not self.hp_filter or cached[1] != NT:
+            cached = (self.hp_filter, NT, fft_highpass(self.hp_filter, NT=NT))
+            self._fwav = cached
+        return cached[2]
 
-        if self.invert_sign:
-            X = X * -1
+    def _highpass_padded(self, X):
+        """High-pass filter with real FFTs of a fast length (KILOSORT_FAST_APPROX).
 
-        X = X - X.mean(1).unsqueeze(1)
+        The default path filters each batch circularly with complex FFTs of
+        length NT + 2*nt, which has a large prime factor (60122 = 2*23*1307)
+        and runs as a slow Bluestein transform. Here the batch is zero-padded
+        to the next 2**a * 3**b length instead. Away from the batch edges the
+        result is the same up to rounding; within ~300 samples of each edge
+        the zero padding replaces the circular wrap-around.
+        """
+        NT = X.shape[1]
+        cached = self.__dict__.get('_fwav_padded')
+        if cached is None or cached[0] is not self.hp_filter or cached[1] != NT:
+            N = _fast_fft_length(NT)
+            L = self.hp_filter.shape[0]
+            h = torch.zeros(N, device=self.hp_filter.device)
+            h[:L] = self.hp_filter
+            h = torch.roll(h, -(L//2))
+            cached = (self.hp_filter, NT, N, torch.conj(rfft(h)))
+            self._fwav_padded = cached
+        N, fh = cached[2], cached[3]
+        return irfft(rfft(X, n=N) * fh, n=N)[:, :NT].contiguous()
+
+    def _highpass_circular(self, X):
+        """The default (circular) high-pass filter, with real FFTs of a fast
+        length instead of complex FFTs of length NT + 2*nt.
+
+        The default filter is the circular correlation
+        y[n] = sum_j h[c+j] x[(n + j + o) mod NT] (c: center of the impulse
+        response h, o: offset from the zero padding and fftshift). h decays
+        quickly (within ~1000 samples for a 300 Hz cutoff at 30 kHz, longer
+        for lower cutoffs), so it is truncated to |j| <= E, at least the
+        smallest E that keeps all but 1e-10 of sum |h|, and X is extended
+        circularly by E samples on each side, after which a linear
+        correlation of length >= NT + 2E gives the same result up to rounding.
+        Returns None if h can't be truncated like that (e.g. X is shorter
+        than the impulse response); the caller then uses the default filter.
+        """
+        NT = X.shape[1]
+        cached = self.__dict__.get('_fwav_circ')
+        if cached is None or cached[0] is not self.hp_filter or cached[1] != NT:
+            h = self.hp_filter
+            ft = h.shape[0]
+            c = ft // 2
+            # The part of h the default filter uses: all of it, or its
+            # central NT samples if it is longer than the batch.
+            lo = (ft - NT) // 2 if ft > NT else 0
+            hi = lo + NT if ft > NT else ft
+            o = (NT - ft) // 2 + c - NT // 2 if ft < NT else c - lo - NT // 2
+            a = h[lo:hi].abs().double().cpu().numpy()
+            cc = c - lo
+            emax = min(cc, len(a) - 1 - cc)
+            # kept[e] = sum of |h[c+j]| over |j| <= e
+            kept = (np.cumsum(a[cc:cc+emax+1])
+                    + np.concatenate(([0.0], np.cumsum(a[cc-1::-1][:emax]))))
+            enough = kept >= a.sum() * (1 - 1e-10)
+            if not enough.any():
+                cached = (self.hp_filter, NT, None)
+            else:
+                Emin = int(np.argmax(enough))
+                N = _fast_fft_length(NT + 2 * Emin)
+                E = min((N - NT) // 2, emax)
+                g = torch.zeros(N, device=h.device)
+                g[:E+1] = h[c:c+E+1]
+                g[N-E:] = h[c-E:c]
+                idx = (torch.arange(NT + 2*E, device=X.device) - E + o) % NT
+                cached = (self.hp_filter, NT, (N, E, torch.conj(rfft(g)), idx))
+            self._fwav_circ = cached
+        if cached[2] is None:
+            return None
+        N, E, fg, idx = cached[2]
+        Z = irfft(rfft(X[:, idx], n=N) * fg, n=N)
+        return Z[:, E:E+NT].contiguous()
+
+    def filter(self, X, ops=None, ibatch=None, skip_preproc=False,
+               selected=False):
+        # `selected`: X already has only the chanMap channels, sign-inverted
+        # if needed (see _loaded_batch).
+        if not selected:
+            # pick only the channels specified in the chanMap
+            if self.chan_map is not None:
+                X = X[self.chan_map]
+
+            if self.invert_sign:
+                X = X * -1
+
+        mean = X.mean(1)
         if self.do_CAR:
             # remove the mean of each channel, and the median across channels
-            X = X - torch.median(X, 0)[0]
-    
+            X = subtract_mean_and_median(X, mean)
+        else:
+            X = X - mean.unsqueeze(1)
+
         if skip_preproc:
             return X
 
         # high-pass filtering in the Fourier domain (much faster than filtfilt etc)
         if self.hp_filter is not None:
-            fwav = fft_highpass(self.hp_filter, NT=X.shape[1])
-            X = torch.real(ifft(fft(X) * torch.conj(fwav)))
-            X = fftshift(X, dim = -1)
+            if fast_approx() and self.hp_filter.shape[0] <= X.shape[1]:
+                X = self._highpass_padded(X)
+            elif (fastest('hpfilter')
+                  and (Y := self._highpass_circular(X)) is not None):
+                X = Y
+            else:
+                fwav = self._fft_highpass(X.shape[1])
+                X = torch.real(ifft(fft(X) * torch.conj(fwav)))
+                X = fftshift(X, dim = -1)
 
         if self.artifact_threshold < np.inf:
             if torch.any(torch.abs(X) >= self.artifact_threshold):
@@ -1036,12 +1312,47 @@ class BinaryFiltered(BinaryRWFile):
         
     def padded_batch_to_torch(self, ibatch, ops=None, return_inds=False,
                               skip_preproc=False):
-        if return_inds:
-            X, inds = super().padded_batch_to_torch(ibatch, return_inds=return_inds)
-            return self.filter(X, ops, ibatch, skip_preproc=skip_preproc), inds
+        if (self._can_prefetch() and self.chan_map is not None
+                and fused_kernels.enabled()):
+            X, inds = self._loaded_batch(ibatch)
+            X = self.filter(X, ops, ibatch, skip_preproc=skip_preproc,
+                            selected=True)
         else:
-            X = super().padded_batch_to_torch(ibatch)
-            return self.filter(X, ops, ibatch, skip_preproc=skip_preproc)
+            X, inds = super().padded_batch_to_torch(ibatch, return_inds=True)
+            X = self.filter(X, ops, ibatch, skip_preproc=skip_preproc)
+        if return_inds:
+            return X, inds
+        return X
+
+    def _loaded_batch(self, ibatch):
+        """`BinaryRWFile.padded_batch_to_torch` + chanMap + sign inversion.
+
+        The raw int16 batch goes to the GPU as stored in the file and one
+        kernel transposes it, selects the chanMap channels and pads the
+        edges, instead of several full-size float copies.
+        """
+        ibatch *= self.batch_downsampling
+        raw, bstart, bend = self._prefetched_batch(ibatch)
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", message=_torch_warning)
+            raw = raw.to(self.device, non_blocking=True)
+        cm = self.__dict__.get('_chan_map_gpu')
+        if cm is None or cm[0] is not self.chan_map:
+            cm = (self.chan_map, torch.as_tensor(np.asarray(self.chan_map),
+                                                 dtype=torch.int64,
+                                                 device=self.device))
+            self._chan_map_gpu = cm
+        first = ibatch == 0
+        last = not first and ibatch == self.n_batches - 1
+        X = load_batch(raw, cm[1], int(self.NT + 2*self.nt),
+                       int(self.nt) if first else 0, first, last,
+                       self.invert_sign)
+        # fix the indices at the edges for the first and last batch
+        if first:
+            bstart = self.imin - self.nt
+        elif last:
+            bend += self.nt
+        return X, [bstart, bend]
 
 
 def save_preprocessing(filename, ops, bfile=None, bfile_path=None, verbose=False):

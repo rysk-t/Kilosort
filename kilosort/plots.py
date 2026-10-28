@@ -1,7 +1,9 @@
+import os
 import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
-import torch
+# torch is imported inside the functions that need it, so that the
+# background plotting processes (see _BackgroundPlots) do not load it.
 
 
 COLOR_CODES = ['b', 'g', 'r', 'c', 'm', 'y', 'k', 'w']
@@ -44,12 +46,13 @@ def plot_drift_amount(ops, results_dir, tmin=0):
     plt.close(fig)
 
 
-def plot_drift_scatter(st0, results_dir, tmin=0):
+def _drift_scatter_figure(st0, tmin=0, corners_only=False):
+    # See _spike_positions_figure for corners_only.
     fig, ax = plt.subplots(1, 1, figsize=(30,14))
 
     x = st0[:,0] + tmin  # spike time in seconds
     y = st0[:,1]         # depth of spike center in microns
-    z = st0[:,2]         # spike amplitude (data)
+    z = st0[:,2].copy()  # spike amplitude (data)
     z[z < 10] = 10
     z[z > 100] = 100
     colors = np.empty((x.shape[0], 4), dtype=float)
@@ -64,33 +67,55 @@ def plot_drift_scatter(st0, results_dir, tmin=0):
     
     # Scatter of spike depth over time, with color intensity proportional
     # to log of amplitude.
-    ax.scatter(x, y, s=3, c=colors)
+    ok = np.isfinite(x) & np.isfinite(y)
+    if corners_only and ok.any():
+        points = ax.scatter([x[ok].min(), x[ok].max()], [y[ok].min(), y[ok].max()],
+                            s=3, c=colors[:2])
+    else:
+        points = ax.scatter(x, y, s=3, c=colors)
     ax.set_xlabel('Time (s)', fontsize=22)
     ax.set_ylabel('Depth (um)', fontsize=22)
     fig.suptitle('Spike amplitude across time and depth', fontsize=30)
     fig.tight_layout()
+    return fig, ax, points, colors, np.column_stack((x, y))
+
+
+def plot_drift_scatter(st0, results_dir, tmin=0):
+    fig, _, _, _, _ = _drift_scatter_figure(st0, tmin)
 
     save_path = results_dir / 'drift_scatter.png'
     fig.savefig(save_path, dpi=300)
     plt.close(fig)
 
 
+def _diagnostics_data(Wall0, ops):
+    """The arrays drawn by `plot_diagnostics`, computed on Wall0's device."""
+    import torch
+    wPCA = ops['wPCA'].cpu().numpy()
+    features = torch.linalg.norm(Wall0, dim=2).cpu().numpy()
+    mean_amp = torch.linalg.norm(Wall0, dim=(1,2)).cpu().numpy()
+    return wPCA, features, mean_amp
+
+
 def plot_diagnostics(Wall0, clu0, ops, results_dir):
+    wPCA, features, mean_amp = _diagnostics_data(Wall0, ops)
+    _draw_diagnostics(wPCA, features, mean_amp, clu0, ops['settings']['fs'],
+                      results_dir)
+
+
+def _draw_diagnostics(wPCA, features, mean_amp, clu0, fs, results_dir):
     plt.style.use('dark_background')
     fig, axes = plt.subplots(2, 2, figsize=(16,16))
-    wPCA = ops['wPCA']
-    settings = ops['settings']
 
     # Top left
-    t = np.arange(wPCA.shape[1])/(settings['fs']/1000)
+    t = np.arange(wPCA.shape[1])/(fs/1000)
     for i in range(wPCA.shape[0]):
         color = COLOR_CODES[i % len(COLOR_CODES)]
-        axes[0][0].plot(t, wPCA[i,:].cpu().numpy(), c=color)
+        axes[0][0].plot(t, wPCA[i,:], c=color)
     axes[0][0].set_xlabel('Time (s)')
     axes[0][0].set_title('Temporal Features')
 
     # Top right
-    features = torch.linalg.norm(Wall0, dim=2).cpu().numpy()
     axes[0][1].imshow(features.T, aspect='auto', vmin=0, vmax=25, cmap='binary_r')
     axes[0][1].set_xlabel('Channel Number')
     axes[0][1].set_ylabel('Unit Number')
@@ -101,7 +126,6 @@ def plot_diagnostics(Wall0, clu0, ops, results_dir):
     spike_counts = np.zeros(n_units)
     for i in range(n_units):
         spike_counts[i] = (clu0[clu0 == i]).size
-    mean_amp = torch.linalg.norm(Wall0, dim=(1,2)).cpu().numpy()
 
     # Bottom left
     axes[1][0].plot(mean_amp)
@@ -122,34 +146,422 @@ def plot_diagnostics(Wall0, clu0, ops, results_dir):
     plt.close(fig)
 
 
-def plot_spike_positions(clu, is_refractory, results_dir):
+def _spike_positions_figure(clu, is_refractory, positions, corners_only=False):
+    # corners_only: draw only the two corners of the positions' bounding box,
+    # which gives the same data limits, axes and layout (the strips replace
+    # the markers anyway) without setting up millions of markers.
     plt.style.use('dark_background')
     fig, ax = plt.subplots(1, 1, figsize=(30,14))
 
-    # 10 colors in palette, last one is gray for non-frefractory
-    clu = clu.copy()
+    # 10 colors in palette, last one is gray for non-frefractory.
+    # Map cluster ids to palette indices through a lookup table instead of
+    # scanning all spikes once per color.
     bad_units = np.unique(clu)[is_refractory == 0]
-    bad_idx = np.isin(clu, bad_units)
-    clu = np.mod(clu, 9)
-    clu[bad_idx] = 9
-    colors = np.empty((clu.shape[0], 4), dtype=float)
-
-    # Map modded cluster ids to colors
-    for i in range(10):
-        subset = (clu == i)
-        rgba = PROBE_PLOT_COLORS[i]
-        colors[subset] = rgba
+    palette_idx = np.mod(np.arange(int(clu.max()) + 1), 9)
+    palette_idx[bad_units] = 9
+    colors = PROBE_PLOT_COLORS[palette_idx[clu]]
 
     # Get x, y positions, add to scatterplot
-    positions = np.load(results_dir / 'spike_positions.npy')
     xs, ys = positions[:,0], positions[:,1]
-    ax.scatter(ys, xs, s=3, c=colors)
+    if corners_only:
+        ok = np.isfinite(xs) & np.isfinite(ys)
+        if ok.any():
+            xs = np.array([xs[ok].min(), xs[ok].max()])
+            ys = np.array([ys[ok].min(), ys[ok].max()])
+            points = ax.scatter(ys, xs, s=3, c=colors[:2])
+        else:
+            corners_only = False
+    if not corners_only:
+        points = ax.scatter(ys, xs, s=3, c=colors)
     ax.set_xlabel('Depth (um)', fontsize=22)
     ax.set_ylabel('Lateral (um)', fontsize=22)
     fig.suptitle('Spike position across probe, colored by cluster', fontsize=30)
     fig.tight_layout()
 
+    return fig, ax, points, colors
+
+
+def plot_spike_positions(clu, is_refractory, results_dir, positions=None):
+    if positions is None:
+        positions = np.load(results_dir / 'spike_positions.npy')
+    fig, _, _, _ = _spike_positions_figure(clu, is_refractory, positions)
+
     save_path = results_dir / 'spike_positions.png'
-    fig.savefig(save_path, dpi=300)
+    fig.savefig(save_path, dpi=_POSITIONS_DPI)
     plt.style.use('default')
     plt.close(fig)
+
+
+_POSITIONS_DPI = 300
+# Pixels added on each side of a strip when selecting the spikes to draw in
+# it; must exceed the marker radius plus antialiasing (about 7 px at dpi 300).
+_STRIP_MARGIN = 20
+
+
+def _render_strip(fig, ax, points, colors, xy, k, n_strips, out, dpi):
+    """Pixel columns of strip `k` of a scatter figure (as in
+    _spike_positions_strip): only the markers that reach into the strip are
+    drawn, in their original order and colors."""
+    import io as _io
+    ax.set_xlim(ax.get_xlim())
+    ax.set_ylim(ax.get_ylim())
+    W = int(round(fig.get_figwidth() * dpi))
+    H = int(round(fig.get_figheight() * dpi))
+    px = (ax.transData + fig.transFigure.inverted()).transform(xy)[:,0] * W
+    finite = px[np.isfinite(px)]
+    inner = np.quantile(finite, np.arange(1, n_strips) / n_strips) if finite.size else []
+    edges = np.concatenate(([0], np.clip(np.round(inner), 0, W), [W])).astype(int)
+    edges = np.maximum.accumulate(edges)
+    c0, c1 = edges[k], edges[k+1]
+    keep = (px >= c0 - _STRIP_MARGIN) & (px < c1 + _STRIP_MARGIN)
+    points.set_offsets(xy[keep])
+    points.set_facecolor(colors[keep])
+    buf = _io.BytesIO()
+    fig.savefig(buf, format='raw', dpi=dpi)
+    plt.close(fig)
+    image = np.frombuffer(buf.getvalue(), np.uint8).reshape(H, W, 4)
+    np.save(out, image[:, c0:c1])
+
+
+def _drift_scatter_strip(st0, tmin, k, n_strips, out):
+    """Strip `k` of the drift scatter plot (the same png when put together)."""
+    corners = 'plot_corners' not in os.environ.get('KS_FASTEST_OFF', '').split(',')
+    fig, ax, points, colors, xy = _drift_scatter_figure(st0, tmin, corners_only=corners)
+    _render_strip(fig, ax, points, colors, xy, k, n_strips, out, 300)
+
+
+def _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out):
+    """Pixel columns of strip `k` of the spike position plot.
+
+    The figure is set up exactly as in `plot_spike_positions` (all spikes,
+    so the axis limits and layout are the same), then only the markers that
+    reach into this strip are kept, in their original order. Every pixel of
+    the strip is covered by the same markers, blended in the same order, as
+    in the full plot, so the strips put side by side give the same image.
+    """
+    import io as _io
+    # This file is loaded on its own in the plotting process (no kilosort
+    # package, see _BackgroundPlots), so read KS_FASTEST_OFF directly.
+    corners = 'plot_corners' not in os.environ.get('KS_FASTEST_OFF', '').split(',')
+    fig, ax, points, colors = _spike_positions_figure(
+        clu, is_refractory, positions, corners_only=corners
+        )
+    ax.set_xlim(ax.get_xlim())
+    ax.set_ylim(ax.get_ylim())
+    W = int(round(fig.get_figwidth() * _POSITIONS_DPI))
+    H = int(round(fig.get_figheight() * _POSITIONS_DPI))
+    xy = np.column_stack((positions[:,1], positions[:,0]))
+    px = (ax.transData + fig.transFigure.inverted()).transform(xy)[:,0] * W
+
+    # Strip edges at quantiles of the marker columns, so that each strip
+    # draws about the same number of markers.
+    finite = px[np.isfinite(px)]
+    inner = np.quantile(finite, np.arange(1, n_strips) / n_strips) if finite.size else []
+    edges = np.concatenate(([0], np.clip(np.round(inner), 0, W), [W])).astype(int)
+    edges = np.maximum.accumulate(edges)
+    c0, c1 = edges[k], edges[k+1]
+
+    keep = (px >= c0 - _STRIP_MARGIN) & (px < c1 + _STRIP_MARGIN)
+    if 'plot_bycolor' in os.environ.get('KS_FASTEST_OFF', '').split(','):
+        points.set_offsets(xy[keep])
+        points.set_facecolor(colors[keep])
+    else:
+        # Single-color scatters (one per palette entry, in 16 consecutive
+        # chunks of all spikes so that later spikes still mostly end up on
+        # top): matplotlib then draws them with its fast marker path instead
+        # of one path per spike (~15 us each). Only the stacking of
+        # overlapping markers of different colors within a chunk differs
+        # from the plot drawn in spike order: there the gray of the units
+        # that are not refractory goes below the colors. The chunks don't
+        # depend on the strips, so neither does the image.
+        bad_units = np.unique(clu)[is_refractory == 0]
+        palette_idx = np.mod(np.arange(int(clu.max()) + 1), 9)
+        palette_idx[bad_units] = 9
+        pal = palette_idx[clu]
+        points.remove()
+        bounds = np.linspace(0, len(clu), 17).astype(int)
+        for i0, i1 in zip(bounds[:-1], bounds[1:]):
+            chunk = i0 + np.nonzero(keep[i0:i1])[0]
+            for g in (9,) + tuple(range(9)):
+                sel = chunk[pal[chunk] == g]
+                if sel.size:
+                    ax.scatter(xy[sel, 0], xy[sel, 1], s=3, c=PROBE_PLOT_COLORS[g:g+1])
+    buf = _io.BytesIO()
+    fig.savefig(buf, format='raw', dpi=_POSITIONS_DPI)
+    plt.style.use('default')
+    plt.close(fig)
+    image = np.frombuffer(buf.getvalue(), np.uint8).reshape(H, W, 4)
+    np.save(out, image[:, c0:c1])
+
+
+class _BackgroundPlots:
+    """Call a function of this module in a separate Python process.
+
+    The plots for long recordings take tens of seconds, during which the GPU
+    would sit idle. They are drawn by a fresh interpreter (``python -c ...``,
+    not multiprocessing) so that user scripts without an
+    ``if __name__ == '__main__'`` guard are never re-imported. The
+    interpreter loads this file directly rather than the kilosort package,
+    whose import pulls in torch and CUDA (several seconds on Windows) that
+    the plots don't need. Call `wait()` before reading the png files.
+    """
+
+    def __init__(self, func_name, args, what, args_path=None, call_args=()):
+        import pickle, subprocess, sys, tempfile
+        self._what = what
+        # With `args_path`, the arguments were pickled by the caller, who
+        # also removes the file.
+        self._owns_args = args_path is None
+        if args_path is None:
+            fd, args_path = tempfile.mkstemp(suffix='.pkl', prefix='ks_plot_')
+            with open(fd, 'wb') as f:
+                pickle.dump(args, f)
+        self._args_path = args_path
+        call = ', '.join(repr(a) for a in (args_path,) + tuple(call_args))
+        code = ('import importlib.util as u; '
+                f's = u.spec_from_file_location("kilosort_plots", {__file__!r}); '
+                'm = u.module_from_spec(s); s.loader.exec_module(m); '
+                f'm.{func_name}({call})')
+        env = dict(os.environ, MPLBACKEND='Agg')
+        self._proc = subprocess.Popen(
+            [sys.executable, '-c', code], env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            )
+
+    def wait(self):
+        """Wait for the plots; raise if the plotting process failed."""
+        if self._proc is None:
+            return
+        try:
+            _, err = self._proc.communicate()
+        except BaseException:
+            # e.g. KeyboardInterrupt: don't leave the process running.
+            self.cancel()
+            raise
+        code, self._proc = self._proc.returncode, None
+        if self._owns_args:
+            try:
+                os.remove(self._args_path)
+            except OSError:
+                pass
+        if code != 0:
+            raise RuntimeError(
+                f'{self._what} failed in background process:\n'
+                + err.decode(errors='replace')
+                )
+
+    def cancel(self):
+        """Stop the plotting process (e.g. after an error) and clean up."""
+        if self._proc is not None:
+            self._proc.kill()
+            self._proc.communicate()
+            self._proc = None
+            if self._owns_args:
+                try:
+                    os.remove(self._args_path)
+                except OSError:
+                    pass
+
+
+class BackgroundDriftPlots(_BackgroundPlots):
+    """`plot_drift_amount` and `plot_drift_scatter` in a separate process
+    (the scatter in parallel strips for many spikes, see _BackgroundStrips)."""
+
+    def __init__(self, ops, st0, results_dir, tmin=0, n_strips=None):
+        from pathlib import Path
+        import torch
+        dshift = ops['dshift']
+        if torch.is_tensor(dshift):
+            dshift = dshift.cpu().numpy()
+        mini_ops = {
+            'dshift': np.asarray(dshift),
+            'settings': {'fs': ops['settings']['fs'],
+                         'batch_size': ops['settings']['batch_size']},
+            }
+        if n_strips is None:
+            n_strips = 1 if len(st0) < 300_000 else min(4, os.cpu_count() or 1)
+        off = os.environ.get('KS_FASTEST_OFF', '').split(',')
+        if n_strips <= 1 or 'drift_strips' in off:
+            self._strips = None
+            super().__init__('_drift_plots_from_file',
+                             (mini_ops, st0, Path(results_dir), tmin), 'Drift plots')
+        else:
+            # The amount plot in this process, the scatter (~15 us per
+            # marker) in strips.
+            self._strips = _BackgroundStrips(
+                '_drift_scatter_strip_from_file', (np.asarray(st0), tmin),
+                n_strips, Path(results_dir) / 'drift_scatter.png', 'Drift scatter plot')
+            try:
+                super().__init__('_drift_amount_from_file',
+                                 (mini_ops, Path(results_dir), tmin), 'Drift plots')
+            except BaseException:
+                self._strips.cancel()
+                raise
+
+    def wait(self):
+        try:
+            super().wait()
+        except BaseException:
+            if self._strips is not None:
+                self._strips.cancel()
+            raise
+        if self._strips is not None:
+            self._strips.wait()
+
+    def cancel(self):
+        super().cancel()
+        if self._strips is not None:
+            self._strips.cancel()
+
+
+class _BackgroundStrips:
+    """A scatter plot drawn as `n_strips` vertical strips in parallel
+    processes (`func_name(args_path, k, n_strips, out)` writes strip k), put
+    together into `png` in `wait()`. The processes are stopped and the
+    temporary files removed also when waiting fails or is interrupted."""
+
+    def __init__(self, func_name, args, n_strips, png, what, dpi=300):
+        import pickle, tempfile
+        self._png = png
+        self._dpi = dpi
+        self._tmpdir = tempfile.mkdtemp(prefix='ks_strips_')
+        args_path = os.path.join(self._tmpdir, 'args.pkl')
+        with open(args_path, 'wb') as f:
+            pickle.dump(args, f)
+        self._strips = [os.path.join(self._tmpdir, f'strip_{k}.npy')
+                        for k in range(n_strips)]
+        self._procs = []
+        try:
+            for k in range(n_strips):
+                self._procs.append(_BackgroundPlots(
+                    func_name, None, what, args_path=args_path,
+                    call_args=(k, n_strips, self._strips[k])))
+        except BaseException:
+            self.cancel()
+            raise
+
+    def wait(self):
+        from matplotlib import image
+        try:
+            # Wait for all processes before raising, so that none of them
+            # still has a file open when the temporary folder is removed.
+            errors = []
+            for p in self._procs:
+                try:
+                    p.wait()
+                except RuntimeError as e:
+                    errors.append(e)
+            if errors:
+                raise errors[0]
+            if self._strips:
+                strips = [np.load(s) for s in self._strips]
+                self._strips = []
+                # Same call as savefig's png writer, so the file is the same.
+                image.imsave(self._png, np.concatenate(strips, axis=1), format='png',
+                             origin='upper', dpi=self._dpi)
+        finally:
+            self.cancel()
+
+    def cancel(self):
+        """Stop the processes still running and remove the temporary files."""
+        import shutil
+        for p in self._procs:
+            p.cancel()
+        if self._tmpdir is not None:
+            shutil.rmtree(self._tmpdir, ignore_errors=True)
+            self._tmpdir = None
+
+
+class BackgroundDiagnostics(_BackgroundPlots):
+    """`plot_diagnostics` in a separate process (norms computed here)."""
+
+    def __init__(self, Wall0, clu0, ops, results_dir):
+        from pathlib import Path
+        wPCA, features, mean_amp = _diagnostics_data(Wall0, ops)
+        super().__init__('_diagnostics_from_file',
+                         (wPCA, features, mean_amp, np.asarray(clu0),
+                          ops['settings']['fs'], Path(results_dir)),
+                         'Diagnostic plots')
+
+
+class BackgroundSpikePositions:
+    """`plot_spike_positions` in separate processes.
+
+    For many spikes, drawing the markers takes most of the time (~28 s for
+    2.7M spikes), so the image is drawn as `n_strips` vertical strips in
+    parallel (see `_spike_positions_strip`) and put together in `wait()`.
+    The png is the same as the one `plot_spike_positions` writes.
+    """
+
+    def __init__(self, clu, is_refractory, positions, results_dir,
+                 n_strips=None):
+        from pathlib import Path
+        results_dir = Path(results_dir)
+        if n_strips is None:
+            many = (len(clu) > 3_000_000 and 'plot_strips12'
+                    not in os.environ.get('KS_FASTEST_OFF', '').split(','))
+            n_strips = 1 if len(clu) < 300_000 else min(
+                12 if many else 6, os.cpu_count() or 1)
+        if n_strips <= 1:
+            self._plots = _BackgroundPlots(
+                '_spike_positions_from_file',
+                (clu, is_refractory, positions, results_dir),
+                'Spike position plot'
+                )
+        else:
+            self._plots = _BackgroundStrips(
+                '_spike_positions_strip_from_file', (clu, is_refractory, positions),
+                n_strips, results_dir / 'spike_positions.png', 'Spike position plot',
+                dpi=_POSITIONS_DPI
+                )
+
+    def wait(self):
+        """Wait for the plot; raise if a plotting process failed."""
+        self._plots.wait()
+
+    def cancel(self):
+        """Stop the plotting processes (e.g. after an error) and clean up."""
+        self._plots.cancel()
+
+
+def _drift_plots_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        mini_ops, st0, results_dir, tmin = pickle.load(f)
+    plot_drift_amount(mini_ops, results_dir, tmin=tmin)
+    plot_drift_scatter(st0, results_dir, tmin=tmin)
+
+
+def _drift_amount_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        mini_ops, results_dir, tmin = pickle.load(f)
+    plot_drift_amount(mini_ops, results_dir, tmin=tmin)
+
+
+def _drift_scatter_strip_from_file(path, k, n_strips, out):
+    import pickle
+    with open(path, 'rb') as f:
+        st0, tmin = pickle.load(f)
+    _drift_scatter_strip(st0, tmin, k, n_strips, out)
+
+
+def _diagnostics_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        args = pickle.load(f)
+    _draw_diagnostics(*args)
+
+
+def _spike_positions_from_file(path):
+    import pickle
+    with open(path, 'rb') as f:
+        clu, is_refractory, positions, results_dir = pickle.load(f)
+    plot_spike_positions(clu, is_refractory, results_dir, positions=positions)
+
+
+def _spike_positions_strip_from_file(path, k, n_strips, out):
+    import pickle
+    with open(path, 'rb') as f:
+        clu, is_refractory, positions = pickle.load(f)
+    _spike_positions_strip(clu, is_refractory, positions, k, n_strips, out)

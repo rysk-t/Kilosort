@@ -1,3 +1,6 @@
+import os
+from concurrent.futures import ThreadPoolExecutor
+
 from numba import njit
 import numpy as np
 import torch
@@ -5,7 +8,9 @@ from torch.nn.functional import conv1d
 import math 
 from tqdm import trange 
 
-@njit()
+from kilosort.utils import fastest, stable_argsort
+
+@njit(cache=True, nogil=True)
 def compute_CCG(st1, st2, tbin = 1/1000, nbins = 500):
 
     st1 = np.sort(st1)
@@ -94,6 +99,8 @@ def check_CCG(st1, st2=None, nbins = 500, tbin  = 1/1000, acg_threshold=0.2,
 def similarity(Wall, W, nt=61):
     WtW = conv1d(W.reshape(-1, 1,nt), W.reshape(-1, 1 ,nt), padding = nt) 
     WtW = torch.flip(WtW, [2,])
+    if W.device.type == 'cuda' and fastest('simgpu'):
+        return _similarity_device(Wall.to(W.device), WtW)
     mu = (Wall**2).sum((1,2), keepdims=True)**.5
     Wnorm = Wall / (1e-6 + mu)
     UtU = torch.einsum('ilk, jlm -> ijkm',  Wnorm, Wnorm)
@@ -101,7 +108,21 @@ def similarity(Wall, W, nt=61):
     similar_templates = similar_templates.max(axis=-1)
     return similar_templates
 
-def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
+def _similarity_device(Wall, WtW):
+    """`similarity` on the device of Wall, in chunks of templates (the
+    (n, n, nt) cross-correlations do not fit in memory for many units)."""
+    mu = (Wall**2).sum((1,2), keepdims=True)**.5
+    Wnorm = Wall / (1e-6 + mu)
+    n, nl = Wall.shape[0], WtW.shape[-1]
+    chunk = max(1, 2**26 // max(1, n * nl))
+    out = torch.empty((n, n), device=Wall.device)
+    for s in range(0, n, chunk):
+        UtU = torch.einsum('ilk, jlm -> ijkm', Wnorm[s:s+chunk], Wnorm)
+        out[s:s+chunk] = torch.einsum('ijkm, kml -> ijl', UtU, WtW).amax(-1)
+    return out.cpu().numpy()
+
+
+def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25, device=None):
     
     Nfilt = iclust2.max()+1
 
@@ -109,13 +130,25 @@ def refract(iclust2, st0, acg_threshold=0.2, ccg_threshold=0.25):
     cross_refractory = np.zeros(Nfilt, )
     R12 = np.zeros(Nfilt, )
 
-    for kk in range(Nfilt):    
-        ix = iclust2==kk
-        st1 = st0[ix]
+    # Group spike indices by cluster once (stable sort keeps each cluster's
+    # spikes in their original order) instead of scanning iclust2 per cluster.
+    order = stable_argsort(iclust2, device)
+    bounds = np.searchsorted(iclust2[order], np.arange(Nfilt + 1))
+
+    def one(kk):
+        st1 = st0[order[bounds[kk]:bounds[kk+1]]]
 
         if (len(st1) > 10) and ((st1.max() - st1.min()) != 0):
             is_refractory[kk], cross_refractory[kk], R12[kk] = check_CCG(
                 st1, acg_threshold=acg_threshold, ccg_threshold=ccg_threshold
                 )
+
+    if fastest('refract_threads'):
+        # compute_CCG releases the GIL; clusters are independent.
+        with ThreadPoolExecutor(max_workers=min(8, os.cpu_count() or 1)) as ex:
+            list(ex.map(one, range(Nfilt)))
+    else:
+        for kk in range(Nfilt):
+            one(kk)
 
     return is_refractory, R12

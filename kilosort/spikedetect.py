@@ -9,9 +9,11 @@ import numpy as np
 import torch
 from sklearn.cluster import KMeans
 from sklearn.decomposition import TruncatedSVD
+from threadpoolctl import threadpool_limits
 from tqdm import tqdm
 
-from kilosort.utils import template_path, log_performance
+from kilosort import fused_kernels
+from kilosort.utils import template_path, log_performance, trying
 
 
 def my_max2d(X, dt):
@@ -81,7 +83,12 @@ def extract_wPCA_wTEMP(ops, bfile, nt=61, twav_min=20, Th_single_ch=6, nskip=25,
         if nthread is not None:
             new_nthread = min(int(nthread), new_nthread)
         os.environ['OMP_NUM_THREADS'] = str(new_nthread)
-        model = KMeans(n_clusters=ops['settings']['n_templates'], n_init = 10).fit(clips)
+        # sklearn's multithreaded KMeans reduces the per-thread partial sums
+        # in thread completion order, so the centers (and with them the
+        # sorting) differ in the last bits from run to run. One OpenMP thread
+        # makes it deterministic (about 0.5 s more per call).
+        with threadpool_limits(limits=1, user_api='openmp'):
+            model = KMeans(n_clusters=ops['settings']['n_templates'], n_init = 10).fit(clips)
         wTEMP = torch.from_numpy(model.cluster_centers_).to(device).float()
         wTEMP = wTEMP / (wTEMP**2).sum(1).unsqueeze(1)**.5
         if nthread is not None:
@@ -131,6 +138,15 @@ def template_centers(ops):
 
 
 def template_match(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
+    if device.type == 'cuda' and fused_kernels.enabled():
+        return fused_kernels.verified_call(
+            'template_match', _template_match_torch, fused_kernels.template_match,
+            X, ops, iC, iC2, weigh, device=device
+            )
+    return _template_match_torch(X, ops, iC, iC2, weigh, device=device)
+
+
+def _template_match_torch(X, ops, iC, iC2, weigh, device=torch.device('cuda')):
     nt = ops['nt']
     nt0 = ops['settings']['nt0min']
     nk = ops['settings']['n_templates']
@@ -196,13 +212,38 @@ def yweighted(yc, iC, adist, xy, device=torch.device('cuda')):
     yct = (cF0 * yy[:,xy[:,0]]).sum(0)
     return yct
 
+def grow_buffer(a, needed, ibatch, n_batches):
+    """Grow the spike buffer `a` (numpy or CPU torch) to hold `needed` rows:
+    at least double it, and go straight to the size that the batches seen so
+    far project for the whole recording (plus 10%), so that it is not copied
+    again and again."""
+    projected = int(needed / (ibatch + 1) * n_batches * 1.1) + 1
+    new_len = max(2 * len(a), projected, needed)
+    shape = (new_len - len(a),) + tuple(a.shape[1:])
+    if isinstance(a, np.ndarray):
+        return np.concatenate((a, np.zeros(shape, a.dtype)), 0)
+    return torch.cat((a, torch.zeros(shape, dtype=a.dtype)), 0)
+
+
 def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
-        clear_cache=False, verbose=False):        
+        clear_cache=False, verbose=False, return_features=True):
+    """Detect spikes with the universal templates.
+
+    With `return_features=False` the PC features (tF) are not computed and
+    None is returned in their place (used for the drift estimate, which only
+    needs the spike times, positions and amplitudes).
+    """
     sig = ops['settings']['min_template_size']
     nsizes = ops['settings']['template_sizes']
     nb = ops['Nbatches']
 
-    if ops['settings']['templates_from_data']:
+    if (ops['settings']['templates_from_data'] and trying('wpca_reuse')
+            and ops.pop('_templates_from_data', False)):
+        # Computed from this recording in the drift pass (before drift
+        # correction) instead of a second time. Off by default: ~6 s faster
+        # on the 45 min sim, but fewer good units on real data.
+        logger.info('Reusing universal templates computed from data.')
+    elif ops['settings']['templates_from_data']:
         logger.info('Re-computing universal templates from data.')
         # Determine templates and PC features from data.
         ops['wPCA'], ops['wTEMP'] = extract_wPCA_wTEMP(
@@ -210,6 +251,9 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             Th_single_ch=ops['settings']['Th_single_ch'], nskip=25,
             device=device
             )
+        if not return_features and trying('wpca_reuse'):
+            # drift pass: the next pass (detect_univ) may reuse them
+            ops['_templates_from_data'] = True
     else:
         logger.info('Using built-in universal templates.')
         # Use pre-computed templates.
@@ -243,7 +287,10 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     weigh = weigh / (weigh**2).sum(1).unsqueeze(1)**.5
 
     st = np.zeros((10**6, 6), 'float64')
-    tF = np.zeros((10**6, nC , ops['settings']['n_pcs']), 'float32')
+    if return_features:
+        tF = np.zeros((10**6, nC , ops['settings']['n_pcs']), 'float32')
+    else:
+        tF = None
 
     k = 0
     nt = ops['nt']
@@ -264,20 +311,27 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
             nsp = len(xy)
 
             if k+nsp>st.shape[0]:
-                st = np.concatenate((st, np.zeros_like(st)), 0)
-                tF = np.concatenate((tF, np.zeros_like(tF)), 0)
+                st = grow_buffer(st, k+nsp, ibatch, bfile.n_batches)
+                if return_features:
+                    tF = grow_buffer(tF, k+nsp, ibatch, bfile.n_batches)
 
-            xsub = X[iC[:,xy[:,:1]], xy[:,1:2] + tarange]
-            xfeat = xsub @ ops['wPCA'].T
-            tF[k:k+nsp] = xfeat.transpose(0,1).cpu().numpy()
+            if return_features:
+                xsub = X[iC[:,xy[:,:1]], xy[:,1:2] + tarange]
+                xfeat = xsub @ ops['wPCA'].T
+                tF[k:k+nsp] = xfeat.transpose(0,1).cpu().numpy()
 
+            # The six columns are assembled on the GPU (float64, the same
+            # operations as before) and copied back in one go.
             t_shift = ibatch * bfile.batch_downsampling * (ops['batch_size']/ops['fs'])
-            st[k:k+nsp,0] = ((xy[:,1].cpu().numpy()-nt)/ops['fs'] + t_shift)
-            st[k:k+nsp,1] = yct.cpu().numpy()
-            st[k:k+nsp,2] = amp.cpu().numpy()
-            st[k:k+nsp,3] = imax.cpu().numpy()
-            st[k:k+nsp,4] = ibatch
-            st[k:k+nsp,5] = xy[:,0].cpu().numpy()
+            cols = torch.stack([
+                (xy[:,1] - nt).double() / ops['fs'] + t_shift,
+                yct.double(),
+                amp.double(),
+                imax.double(),
+                torch.full((nsp,), float(ibatch), dtype=torch.float64, device=device),
+                xy[:,0].double(),
+                ], 1)
+            st[k:k+nsp] = cols.cpu().numpy()
 
             k = k + nsp
             if clear_cache:
@@ -300,7 +354,8 @@ def run(ops, bfile, device=torch.device('cuda'), progress_bar=None,
     log_performance(logger, 'debug', f'Batch {ibatch} of {nb-1} ({100*(ibatch/nb):.1f}%)')
 
     st = st[:k]
-    tF = tF[:k]
+    if return_features:
+        tF = tF[:k]
     ops['iC'] = iC
     ops['iC2'] = iC2
     ops['weigh'] = weigh

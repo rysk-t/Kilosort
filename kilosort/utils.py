@@ -33,6 +33,35 @@ PROBE_URLS = {
 }
 
 
+def fastest(feature):
+    """True unless `feature` is listed in the KS_FASTEST_OFF environment
+    variable (comma separated). The speed-only changes of this branch, which
+    do not reproduce upstream bit for bit, can be switched off one by one."""
+    off = os.environ.get('KS_FASTEST_OFF', '')
+    return feature not in {f.strip() for f in off.split(',')}
+
+
+def trying(feature):
+    """True if `feature` is listed in the KS_FASTEST_TRY environment variable
+    (comma separated): changes of this branch that are off by default
+    because they changed the results on test data."""
+    on = os.environ.get('KS_FASTEST_TRY', '')
+    return feature in {f.strip() for f in on.split(',')}
+
+
+def stable_argsort(a, device=None):
+    """np.argsort(a, kind='stable'), on `device` for large integer arrays
+    when it is a CUDA device (a stable sort has only one answer, so the
+    result is the same). Without a device it stays on the CPU."""
+    a = np.asarray(a)
+    if (device is not None and torch.device(device).type == 'cuda'
+            and a.size > 2**20 and a.dtype.kind in 'iu'
+            and fastest('gpu_argsort')):
+        t = torch.from_numpy(np.ascontiguousarray(a)).to(device)
+        return torch.sort(t, stable=True).indices.cpu().numpy()
+    return np.argsort(a, kind='stable')
+
+
 def template_path(basename='wTEMP.npz'):
     """ currently only one set of example templates to use"""
     return cache_template_path(basename)

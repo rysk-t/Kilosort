@@ -1,5 +1,8 @@
 import gc
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 
 import numpy as np
 import torch
@@ -11,10 +14,13 @@ from scipy.cluster.vq import kmeans
 import faiss
 from tqdm import tqdm 
 
-from kilosort import hierarchical, swarmsplitter
-from kilosort.utils import log_performance
+from kilosort import fused_kernels, hierarchical, swarmsplitter
+from kilosort.utils import log_performance, fastest, stable_argsort
 
 logger = logging.getLogger(__name__)
+
+# Time the last `run` spent waiting for the prefetch thread (for profiling).
+run_stats = {'prefetch_wait': 0.0}
 
 
 def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
@@ -66,21 +72,158 @@ def neigh_mat(Xd, nskip=1, n_neigh=10, max_sub=25000):
     return kn, M
 
 
+def neigh_mat_gpu(Xg, nskip=1, n_neigh=10, max_sub=25000):
+    """`neigh_mat` with the exact neighbor search done on the GPU.
+
+    Same subset and graph as `neigh_mat`, but the distances are computed with
+    torch (|y|^2 - 2 x.y, chunked over spikes) instead of faiss on the CPU,
+    so ties and the last bits of the distances may differ. Returns `kn` as a
+    tensor on the device of `Xg`.
+    """
+    n_samples = Xg.shape[0]
+    sub = np.arange(0, n_samples, nskip)
+    n1 = sub.size
+    if (max_sub is not None) and (n1 > max_sub):
+        idx, rev_idx = subsample_idx(n1, n1 - max_sub)
+        sub = sub[idx]
+    else:
+        rev_idx = None
+    n_nodes = sub.size
+    Xsub = Xg[torch.from_numpy(sub).to(Xg.device)]
+    # Distances are computed from data centered on the subset's mean, which
+    # leaves them unchanged but keeps |y|^2 - 2 x.y from losing precision to
+    # cancellation when the data are far from the origin.
+    mu = Xsub.mean(0)
+    Xsub = Xsub - mu
+    sq = (Xsub**2).sum(1)
+    # About 256 MiB of distances per chunk.
+    chunk = max(1, min(n_samples, 2**26 // max(n_nodes, 1)))
+    kn = torch.empty((n_samples, n_neigh), dtype=torch.int64, device=Xg.device)
+    for s in range(0, n_samples, chunk):
+        d = torch.addmm(sq.unsqueeze(0), Xg[s:s+chunk] - mu, Xsub.T, alpha=-2)
+        kn[s:s+chunk] = torch.topk(d, n_neigh, dim=1, largest=False).indices
+
+    skip_idx = np.arange(0, n_samples, nskip)
+    if rev_idx is not None:
+        skip_idx = skip_idx[rev_idx]
+
+    # Every row has exactly n_neigh distinct columns, so the CSR arrays can be
+    # written directly (sorted columns, as scipy's COO conversion gives).
+    # Self connections are stored as explicit zeros, like
+    # M[skip_idx, np.arange(n_nodes)] = 0 does when they are present; a
+    # missing one is simply absent, which gives the same sums and products.
+    cols = torch.sort(kn, dim=1).values
+    self_col = torch.full((n_samples,), -1, dtype=torch.int64, device=Xg.device)
+    self_col[torch.from_numpy(skip_idx).to(Xg.device)] = torch.arange(n_nodes, device=Xg.device)
+    data = (cols != self_col.unsqueeze(1)).to(torch.float32)
+    M = csr_matrix((data.cpu().numpy().ravel(), cols.cpu().numpy().ravel(),
+                    np.arange(0, n_samples * n_neigh + 1, n_neigh)),
+                   (n_samples, n_nodes))
+
+    return kn, M
+
+
+def _counts(idx, n, like):
+    # Same as coo((zeros, idx), ones, (1, n)).to_dense(). Adding 1.0 is exact,
+    # so the order of the atomic adds doesn't matter. scatter_add_ is used
+    # instead of bincount because bincount syncs with the GPU to size its output.
+    c = torch.zeros(n, dtype=like.dtype, device=like.device)
+    c.scatter_add_(0, idx.long(), torch.ones(idx.shape[0], dtype=like.dtype,
+                                             device=like.device))
+    return c.unsqueeze(0)
+
+
+_assign_kernel_state = {}
+
+
+def _assign_kernel_ok(kn, isub, ki):
+    """Whether the CuPy kernel for assign_iclust can be used: CuPy present,
+    supported dtypes, and the kernel for this number of neighbors (K, a
+    compile-time constant) compiles on this device. Checked (and compiled)
+    outside of any graph capture, once per device and K."""
+    if not (kn.dtype == isub.dtype == torch.int64 and ki.dtype == torch.float32):
+        return False
+    K = kn.shape[1]
+    key = ('assign', kn.device, K)
+    if key not in _assign_kernel_state:
+        ok = fused_kernels.enabled()
+        if ok:
+            try:
+                with fused_kernels._device(kn):
+                    fused_kernels._function('assign', 'assign_iclust_kernel', (('K', K),))
+            except Exception as e:
+                logger.info(f'assign_iclust kernel unavailable ({e!r}); using PyTorch.')
+                ok = False
+        _assign_kernel_state[key] = ok
+    return _assign_kernel_state[key]
+
+
+def _kpp_kernel_ok(Xg, ntry):
+    """Whether the CuPy kernel for kmeans_plusplus can be used (as above)."""
+    if Xg.dtype != torch.float32 or ntry > 1024:
+        return False
+    key = ('kpp', Xg.device)
+    if key not in _assign_kernel_state:
+        ok = fused_kernels.enabled()
+        if ok:
+            try:
+                with fused_kernels._device(Xg):
+                    fused_kernels._function('kpp', 'kpp_vsum_kernel',
+                                            (('ROWS', fused_kernels._KPP_ROWS),))
+            except Exception as e:
+                logger.info(f'kmeans_plusplus kernel unavailable ({e!r}); using PyTorch.')
+                ok = False
+        _assign_kernel_state[key] = ok
+    return _assign_kernel_state[key]
+
+
+def _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki):
+    """Same result as the dense `assign_iclust` for lam > 0, without the
+    (n_spikes, nclust) score matrix.
+
+    A spike's score for cluster c is (number of its neighbors in c) - a*kN[c]
+    with a = lam/m * ki >= 0, so only the clusters of its neighbors and the
+    best other cluster (smallest kN, then smallest index) can win. The scores
+    are computed with the same operations as the dense version, and ties go
+    to the smallest cluster index as in torch.argmax.
+    """
+    K = kn.shape[1]
+    kN = _counts(isub, nclust, tones2)[0]
+    if (kn.is_cuda and kN.dtype == torch.float32 and _assign_kernel_ok(kn, isub, ki)
+            and fastest('assign_kernel')):
+        top = torch.sort(kN, stable=True).indices[:K+1]
+        return fused_kernels.assign_iclust(isub, kn, kN, ki, top, lam/m)
+    L = isub[kn]                                   # (n_spikes, n_neigh)
+    cnt = (L.unsqueeze(2) == L.unsqueeze(1)).sum(2).to(tones2.dtype)
+    s_nb = cnt - lam/m * (ki.unsqueeze(-1) * kN[L])
+    # Best cluster outside the neighbors: first of the K+1 smallest kN
+    # (stable sort keeps the index order for equal kN) that no neighbor has.
+    top = torch.sort(kN, stable=True).indices[:K+1]
+    taken = (L.unsqueeze(2) == top.view(1, 1, -1)).any(1)
+    c_out = top[(~taken).to(torch.uint8).argmax(1)]
+    s_out = torch.zeros_like(ki) - lam/m * (ki * kN[c_out])
+    S = torch.cat((s_nb, s_out.unsqueeze(1)), 1)
+    ids = torch.cat((L, c_out.unsqueeze(1)), 1)
+    best = S.max(1, keepdim=True).values
+    return torch.where(S == best, ids, nclust).min(1).values
+
+
 def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=torch.device('cuda')):
     n_spikes = kn.shape[0]
+    nclust = int(nclust)
+    if lam > 0 and nclust > kn.shape[1] and fastest('sparse_assign'):
+        return _assign_iclust_sparse(isub, kn, tones2, nclust, lam, m, ki)
 
-    ij = torch.vstack((rows_neigh.flatten(), isub[kn].flatten()))
-    xN = coo(ij, tones2.flatten(), (n_spikes, nclust))
-    xN = xN.to_dense()
+    # Dense version of coo((rows_neigh, isub[kn]), tones2).to_dense(), built
+    # directly with scatter_add_ (same values, far fewer kernels).
+    xN = torch.zeros(n_spikes * nclust, dtype=tones2.dtype, device=tones2.device)
+    xN.scatter_add_(0, (rows_neigh * nclust + isub[kn]).flatten(), tones2.flatten())
+    xN = xN.view(n_spikes, nclust)
 
     if lam > 0:
-        tones = torch.ones(len(kj), device = device)
-        tzeros = torch.zeros(len(kj), device = device)
-        ij = torch.vstack((tzeros, isub))    
-        kN = coo(ij, tones, (1, nclust))
-    
-        xN = xN - lam/m * (ki.unsqueeze(-1) * kN.to_dense()) 
-    
+        kN = _counts(isub, nclust, tones2)
+        xN = xN - lam/m * (ki.unsqueeze(-1) * kN)
+
     iclust = torch.argmax(xN, 1)
 
     return iclust
@@ -88,18 +231,17 @@ def assign_iclust(rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj, device=t
 
 def assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,ki,kj, device=torch.device('cuda')):
     n_neigh = kn.shape[1]
+    nclust = int(nclust)
     cols = iclust.unsqueeze(-1).tile((1, n_neigh))
-    iis = torch.vstack((kn.flatten(), cols.flatten()))
 
-    xS = coo(iis, tones2.flatten(), (nsub, nclust))
-    xS = xS.to_dense()
+    # Dense version of coo((kn, cols), tones2).to_dense(), see assign_iclust.
+    xS = torch.zeros(nsub * nclust, dtype=tones2.dtype, device=tones2.device)
+    xS.scatter_add_(0, (kn * nclust + cols).flatten(), tones2.flatten())
+    xS = xS.view(nsub, nclust)
 
     if lam > 0:
-        tones = torch.ones(len(ki), device = device)
-        tzeros = torch.zeros(len(ki), device = device)
-        ij = torch.vstack((tzeros, iclust))    
-        kN = coo(ij, tones, (1, nclust))
-        xS = xS - lam / m * (kj.unsqueeze(-1) * kN.to_dense())
+        kN = _counts(iclust, nclust, tones2)
+        xS = xS - lam / m * (kj.unsqueeze(-1) * kN)
 
     isub = torch.argmax(xS, 1)
     return isub
@@ -118,9 +260,92 @@ def Mstats(M, device=torch.device('cuda')):
     return m, ki, kj
 
 
+# Number of iterations run normally before the rest of a loop is replayed
+# from a CUDA graph (the first iterations also warm up the caching allocator).
+_N_EAGER = 2
+
+# Captures in _replay_graph are sequential and their intermediate tensors do
+# not escape. Retain the latest graph per device to keep its private pool
+# alive, then reuse its pool and capture stream for the next graph. A pool
+# handle alone does not keep its allocator pool alive after its last graph is
+# destroyed, and allocator blocks cannot be reused across capture streams.
+_graph_pools = {}
+_graph_cleanup_limits = {}
+_graph_pool_lock = Lock()
+
+
+def _replay_graph(step, n, device, done=None, every=4):
+    """Record one call of `step` as a CUDA graph and replay it `n` times.
+
+    With `done` (a callable returning True once further replays can't change
+    the state), the replays stop early: `done` is checked every `every`
+    replays (each check waits for the GPU).
+
+    The clustering loops launch many tiny kernels per iteration, so their
+    runtime is dominated by launch overhead. Recording does not execute
+    `step`, so the replays run exactly `n` iterations. `step` must update its
+    state in place, and its random draws come from the same generator state
+    as eager execution would (PyTorch handles the Philox offsets).
+    """
+    if n <= 0:
+        return
+    # Sharing a pool is only safe while graph lifetimes and replays do not
+    # overlap. Serialize the whole capture/replay/release, including callers
+    # from separate threads, and keep externally visible state outside it.
+    with _graph_pool_lock, torch.cuda.device(device):
+        device = torch.cuda.current_device()
+        previous = _graph_pools.get(device)
+        pool = previous[0].pool() if previous is not None else torch.cuda.graph_pool_handle()
+        capture_stream = previous[1] if previous is not None else torch.cuda.Stream()
+        g = torch.cuda.CUDAGraph()
+        # Avoid torch.cuda.graph's gc.collect()/empty_cache() on older PyTorch.
+        # thread_local allows the CPU-only prefetch thread to keep running.
+        torch.cuda.synchronize(device)
+        with torch.cuda.stream(capture_stream):
+            g.capture_begin(pool=pool, capture_error_mode='thread_local')
+            try:
+                step()
+            finally:
+                g.capture_end()
+        for i in range(n):
+            g.replay()
+            if done is not None and (i + 1) % every == 0 and i + 1 < n and done():
+                break
+        # Finish before releasing the previous graph or reusing its pool.
+        torch.cuda.current_stream(device).synchronize()
+        _graph_pools[device] = (g, capture_stream)
+        # WDDM may spill reserved blocks to system RAM before an allocation
+        # fails. Periodically discard fragmented pools before that happens.
+        base_limit = min(4 * 2**30, int(torch.cuda.get_device_properties(device).total_memory * 0.4))
+        limit = _graph_cleanup_limits.get(device, base_limit)
+        if torch.cuda.memory_reserved(device) > limit:
+            _graph_pools.pop(device)
+            del previous, g
+            torch.cuda.empty_cache()
+            # Avoid clearing on every capture if live allocations already
+            # exceed the normal limit; retry after another 512 MiB of growth.
+            _graph_cleanup_limits[device] = max(base_limit, torch.cuda.memory_reserved(device) + 512 * 2**20)
+
+
+def _release_graph_pool(device, *, empty_cache=False):
+    """Release the retained graph so its pool can be freed by the allocator."""
+    if torch.device(device).type != 'cuda':
+        return False
+    with _graph_pool_lock, torch.cuda.device(device):
+        index = torch.cuda.current_device()
+        _graph_cleanup_limits.pop(index, None)
+        released = _graph_pools.pop(index, None) is not None
+        if empty_cache:
+            # Serialize cache release with other threads' graph captures.
+            torch.cuda.empty_cache()
+        return released
+
+
 def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
             nclust=200, seed=1, niter=200, lam=0, device=torch.device('cuda'),
-            verbose=False):    
+            verbose=False, M=None, Xg=None):
+    # kn and M from neigh_mat can be passed in together (see `run`), and Xg
+    # (Xd already on `device`) to avoid a second copy.
 
     if kn is None:
         # kn: n_spikes by n_neigh with integer indices into the spike subset
@@ -134,8 +359,9 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
         logger.debug(f'kj: {kj.nbytes / (2**20):.2f} MB, shape: {kj.shape}')
         log_performance(logger, header='clustering_qr.cluster, after Mstats')
 
-    Xg = Xd.to(device)
-    kn = torch.from_numpy(kn).to(device)
+    if Xg is None:
+        Xg = Xd.to(device)
+    kn = kn.to(device) if torch.is_tensor(kn) else torch.from_numpy(kn).to(device)
     n_spikes, n_neigh = kn.shape
     nsub = M.shape[1]  # number of spikes in neighbor-finding subset
 
@@ -159,6 +385,26 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
         iclust_init = iclust.clone()
         
     for t in range(niter):
+        if device.type == 'cuda' and t == _N_EAGER:
+            # Replay the remaining iterations from a CUDA graph.
+            static_iclust = iclust.clone()
+            # An iteration that leaves iclust unchanged is a fixed point (isub
+            # and the next iclust only depend on iclust), so all later
+            # iterations give the same result and can be skipped (fastest).
+            changed = torch.ones((), dtype=torch.bool, device=device)
+            def step():
+                isub = assign_isub(static_iclust, kn, tones2, nclust, nsub, lam,
+                                   m, ki, kj, device=device)
+                new = assign_iclust(
+                    rows_neigh, isub, kn, tones2, nclust, lam, m, ki, kj,
+                    device=device
+                    )
+                changed.copy_((new != static_iclust).any())
+                static_iclust.copy_(new)
+            done = (lambda: not bool(changed)) if fastest('early_stop') else None
+            _replay_graph(step, niter - t, static_iclust.device, done=done)
+            iclust = static_iclust
+            break
         # given iclust, reassign isub
         isub = assign_isub(iclust, kn, tones2, nclust, nsub, lam, m,
                            ki, kj,device=device)
@@ -178,6 +424,21 @@ def cluster(Xd, iclust=None, kn=None, nskip=1, n_neigh=10, max_sub=25000,
     isub = isub.cpu().numpy()
 
     return iclust, isub, M, iclust_init
+
+
+def _multinomial_noreplace(p, n):
+    """Same draws as torch.multinomial(p, n, replacement=False).
+
+    torch.multinomial samples without replacement by drawing exponential
+    noise q, then taking topk(p / q). It also validates `p` with several
+    .item() calls, which forces a GPU sync on every call. This does the same
+    sampling (same RNG consumption, same result) without the validation.
+    Unlike torch.multinomial it does not raise if `p` has fewer than `n`
+    non-zero entries.
+    """
+    q = torch.empty_like(p).exponential_(1)
+    q = p / q
+    return torch.topk(q, n).indices
 
 
 def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=False):
@@ -218,48 +479,75 @@ def kmeans_plusplus(Xg, niter=200, seed=1, device=torch.device('cuda'), verbose=
     # We ask, if we were to add another centroid, which spikes would that
     # increase the explained variance for and by how much?
     # We use ntry candidates on each iteration.
-    for j in range(niter):
+    # The iteration number is kept on the GPU (jt) and all state is updated
+    # in place, so that one iteration can be replayed from a CUDA graph.
+    jt = torch.zeros((), dtype=torch.int, device=device)
+    # Fused column sums (CuPy) instead of the (n_spikes, ntry) temporaries;
+    # 2 * Xg is computed once (the same values as in every iteration).
+    fused = Xg.is_cuda and fastest('kpp_kernel') and _kpp_kernel_ok(Xg, ntry)
+    if fused:
+        Xg2 = 2 * Xg
+
+    def step():
         # v2 is the un-explained variance so far for each spike
         v2 = torch.relu(vtot - vexp0)
 
         # We sample ntry new candidate centroids based on how much un-explained variance they have
         # more unexplained variance makes it more likely to be selected
-        # Only one of these candidates will be added this iteration. 
+        # Only one of these candidates will be added this iteration.
         if subsample:
-            isamp = rev_idx[torch.multinomial(v2[idx], ntry)]
+            isamp = rev_idx[_multinomial_noreplace(v2[idx], ntry)]
         else:
-            isamp = torch.multinomial(v2, ntry)
+            isamp = _multinomial_noreplace(v2, ntry)
 
+        # The new centroids to be tested, sampled from the spikes in Xg.
+        Xc = Xg[isamp]
+        if fused:
+            P = Xg2 @ Xc.T
+            csq = (Xc**2).sum(1)
+            vsum = fused_kernels.kpp_vsum(P, csq, vexp0)
+            imax = torch.argmax(vsum).view(1)
+            vcol = P.index_select(1, imax).squeeze(1) - csq.index_select(0, imax)
+            ix = torch.relu(vcol - vexp0) > 0
+            iclust.copy_(torch.where(ix, jt, iclust))
+            mu.index_copy_(0, jt.view(1).long(), Xc.index_select(0, imax))
+            vexp0.copy_(torch.where(ix, vcol, vexp0))
+            jt.add_(1)
+            return
+        # Variance explained for each spike for the new centroids.
+        vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
+        # Difference between variance explained for new centroids
+        # and best explained variance so far across all iterations.
+        # This gets relu-ed, since only the positive increases will actually
+        # re-assign a spike to this new cluster
+        dexp = torch.relu(vexp - vexp0.unsqueeze(1))
+        # Sum all positive increases to determine additional explained variance
+        # for each candidate centroid.
+        vsum = dexp.sum(0)
+        # Pick the candidate which increases explained variance the most
+        imax = torch.argmax(vsum).view(1)
+
+        # For that centroid (Xc[imax]), determine which spikes actually get
+        # more variance from it.
+        # NOTE: torch.where instead of boolean-mask indexing, which syncs
+        #       with the GPU (nonzero) on every iteration.
+        ix = dexp.index_select(1, imax).squeeze(1) > 0
+
+        iclust.copy_(torch.where(ix, jt, iclust))    # assign new cluster identity
+        # spike features used as centroid for cluster j
+        mu.index_copy_(0, jt.view(1).long(), Xc.index_select(0, imax))
+        # Update variance explained for the spikes assigned to cluster j
+        vexp0.copy_(torch.where(ix, vexp.index_select(1, imax).squeeze(1), vexp0))
+        jt.add_(1)
+
+    # The subsampling path indexes with CPU arrays, which can't be captured.
+    use_graph = device.type == 'cuda' and not subsample
+    for j in range(niter):
         try:
-            # The new centroids to be tested, sampled from the spikes in Xg.
-            Xc = Xg[isamp]
-            # Variance explained for each spike for the new centroids.
-            vexp = 2 * Xg @ Xc.T - (Xc**2).sum(1)
-            # Difference between variance explained for new centroids
-            # and best explained variance so far across all iterations.
-            # This gets relu-ed, since only the positive increases will actually
-            # re-assign a spike to this new cluster
-            dexp = torch.relu(vexp - vexp0.unsqueeze(1))
-            # Sum all positive increases to determine additional explained variance
-            # for each candidate centroid.
-            vsum = dexp.sum(0)
-            # Pick the candidate which increases explained variance the most 
-            imax = torch.argmax(vsum)
-
-            # For that centroid (Xc[imax]), determine which spikes actually get
-            # more variance from it
-            ix = dexp[:, imax] > 0
-
-            iclust[ix] = j    # assign new cluster identity
-            mu[j] = Xc[imax]  # spike features used as centroid for cluster j
-            # Update variance explained for the spikes assigned to cluster j
-            vexp0[ix] = vexp[ix, imax]
-
-            # Delete large variables between iterations
-            # to prevent excessive memory reservation.
-            del(vexp)
-            del(dexp)
-
+            if use_graph and j == _N_EAGER:
+                _replay_graph(step, niter - j, Xg.device)
+                break
+            step()
         except torch.cuda.OutOfMemoryError:
             logger.debug(f"OOM in kmeans_plus_plus iter {j}, nsp: {Xg.shape[0]}, "
                          f"Xg size: {Xg.nbytes / (2**20):.2f} MB.")
@@ -434,9 +722,43 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     ycent = y_centers(ops)
     xcent = x_centers(ops)
     nsp = st.shape[0]
+    run_stats['prefetch_wait'] = 0.0
     nearest_center, _, _ = get_nearest_centers(xy, xcent, ycent)
     total_centers = np.unique(nearest_center).size
-    
+
+    # get_data_cpu and the neighbor search (faiss, on the CPU) for the next
+    # center run on a background thread while the GPU clusters the current
+    # one. The thread only touches CPU data (iC is copied to the CPU; its
+    # values are integers, so get_data_cpu returns the same result).
+    centers = [(jj, kk) for jj in range(len(xcent)) for kk in range(len(ycent))
+               if kk + jj*ycent.size in nearest_center]
+    iC_cpu = iC.cpu() if torch.is_tensor(iC) else iC
+    template_groups = _template_groups(iclust_template, device)
+    # The neighbor search runs on the GPU in the main thread instead (much
+    # faster than faiss for the large centers of long recordings).
+    knn_gpu = torch.device(device).type == 'cuda' and fastest('knn')
+    # The regressions of swarmsplitter.split also run on the GPU.
+    split_gpu = torch.device(device).type == 'cuda' and fastest('splitgpu')
+
+    def prepare_center(jj, kk):
+        ix = (nearest_center == kk + jj*ycent.size)
+        Xd, igood, ichan = get_data_cpu(
+            ops, xy, iC_cpu, iclust_template, tF, ycent[kk], xcent[jj],
+            dmin=dmin, dminx=dminx, ix=ix, _groups=template_groups,
+            )
+        kn = M = None
+        if Xd is not None and Xd.shape[0] >= 1000 and not knn_gpu:
+            kn, M = neigh_mat(Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub)
+        return ix, Xd, igood, ichan, kn, M
+
+    prefetch = ThreadPoolExecutor(max_workers=1, thread_name_prefix='kilosort-clustering')
+    futures = {}
+    def submit(ci):
+        if ci < len(centers):
+            futures[ci] = prefetch.submit(prepare_center, *centers[ci])
+    submit(0)
+    ci = 0
+
     clu = np.zeros(nsp, 'int32')
     Wall = torch.zeros((0, ops['Nchan'], ops['settings']['n_pcs']))
     Nfilt = None
@@ -457,7 +779,12 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     continue
                 else:
                     t += 1
-                ix = (nearest_center == ii)
+                # Start preparing the next center, then collect this one.
+                submit(ci + 1)
+                tw = time.perf_counter()
+                ix, Xd, igood, ichan, kn, M = futures.pop(ci).result()
+                run_stats['prefetch_wait'] += time.perf_counter() - tw
+                ci += 1
                 ntemp = ix.sum()
 
                 v = False
@@ -469,10 +796,6 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     if verbose:
                         v = True
 
-                Xd, igood, ichan = get_data_cpu(
-                    ops, xy, iC, iclust_template, tF, ycent[kk], xcent[jj],
-                    dmin=dmin, dminx=dminx, ix=ix,
-                    )
                 if Xd is None:
                     nearby_chans_empty += 1
                     continue
@@ -491,25 +814,38 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
                     else:
                         st0 = None
 
+                    Xg = None
+                    if knn_gpu or split_gpu:
+                        Xg = Xd.to(device)
+                    if knn_gpu:
+                        kn, M = neigh_mat_gpu(Xg, nskip=nskip, n_neigh=n_neigh,
+                                              max_sub=max_sub)
+
                     # find new clusters
                     iclust, iclust0, M, _ = cluster(
-                        Xd, nskip=nskip, n_neigh=n_neigh, max_sub=max_sub,
-                        lam=1, seed=seed, device=device, verbose=v
+                        Xd, kn=kn, M=M, nskip=nskip, n_neigh=n_neigh,
+                        max_sub=max_sub, lam=1, seed=seed, device=device,
+                        verbose=v, Xg=Xg
                         )
 
                     if clear_cache:
                         if v:
                             log_performance(logger, header='clustering_qr before gc')
                         gc.collect()
-                        torch.cuda.empty_cache()
+                        if torch.device(device).type == 'cuda':
+                            _release_graph_pool(device, empty_cache=True)
+                        else:
+                            torch.cuda.empty_cache()
                         if v:
                             log_performance(logger, header='clustering_qr after gc')
 
                     xtree, tstat, my_clus = hierarchical.maketree(M, iclust, iclust0)
 
                     xtree, tstat = swarmsplitter.split(
-                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0
+                        Xd.numpy(), xtree, tstat,iclust, my_clus, meta=st0,
+                        Xg=Xg if split_gpu else None
                         )
+                    del Xg
 
                     iclust = swarmsplitter.new_clusters(iclust, my_clus, xtree, tstat)
 
@@ -522,9 +858,18 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
 
                 # we need the new templates here         
                 W = torch.zeros((Nfilt, ops['Nchan'], ops['settings']['n_pcs']))
-                for j in range(Nfilt):
-                    w = Xd[iclust==j].mean(0)
-                    W[j, ichan, :] = torch.reshape(w, (-1, ops['settings']['n_pcs'])).cpu()
+                if fastest('wmean'):
+                    # All cluster means in one pass over Xd (sum / count).
+                    lab = torch.as_tensor(np.asarray(iclust)).long()
+                    wsum = torch.zeros((Nfilt, Xd.shape[1]), dtype=Xd.dtype)
+                    wsum.index_add_(0, lab, Xd)
+                    cnt = torch.bincount(lab, minlength=Nfilt).to(Xd.dtype)
+                    w = wsum / cnt.unsqueeze(1)
+                    W[:, ichan, :] = w.reshape(Nfilt, -1, ops['settings']['n_pcs'])
+                else:
+                    for j in range(Nfilt):
+                        w = Xd[iclust==j].mean(0)
+                        W[j, ichan, :] = torch.reshape(w, (-1, ops['settings']['n_pcs'])).cpu()
                 
                 Wall = torch.cat((Wall, W), 0)
 
@@ -541,7 +886,15 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
             logger.debug('iclust not yet assigned')
             pass
         raise
+    finally:
+        for f in futures.values():
+            f.cancel()
+        prefetch.shutdown(wait=True)
+        # Graph-private cached blocks otherwise remain reserved after the
+        # graph is gone, including on WDDM where allocations can spill.
+        _release_graph_pool(device, empty_cache=True)
 
+    logger.debug(f"clustering_qr.run: main thread waited {run_stats['prefetch_wait']:.2f} s for prefetch")
     if nearby_chans_empty == total_centers:
         raise ValueError(
             f'`get_data_cpu` never found suitable channels in `clustering_qr.run`.'
@@ -557,9 +910,23 @@ def run(ops, st, tF, mode='template', device=torch.device('cuda'),
     return clu, Wall
 
 
+def _template_groups(PID, device=None):
+    """Group spike indices by template with one stable argsort.
+
+    The result is a snapshot: callers may reuse it while PID is unchanged.
+    Never cache by object identity, since PID may be mutated in place.
+    """
+    if torch.is_tensor(PID):
+        PID = PID.detach().cpu().numpy()
+    nvals = int(PID.max()) + 1 if PID.size else 0
+    order = stable_argsort(PID, device)
+    bounds = np.searchsorted(PID[order], np.arange(nvals + 1))
+    return order, bounds
+
+
 def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
-                 ix=None, merge_dim=True):
-    PID =  torch.from_numpy(PID).long()
+                 ix=None, merge_dim=True, _groups=None):
+    PID_np = PID.detach().cpu().numpy() if torch.is_tensor(PID) else PID
 
     #iU = ops['iU'].cpu().numpy()
     #iC = ops['iCC'][:, ops['iU']]    
@@ -575,21 +942,44 @@ def get_data_cpu(ops, xy, iC, PID, tF, ycenter, xcenter, dmin=20, dminx=32,
             torch.abs(xy[1] - y0) < dmin,
             torch.abs(xy[0] - x0) < dminx
             )
-    igood = ix[PID].nonzero()[:,0]
+    # Same as ix[PID].nonzero()[:,0] (spikes from the selected templates, in
+    # ascending order), without a pass over all spikes for every call.
+    order, bounds = _template_groups(PID_np) if _groups is None else _groups
+    tids = ix.nonzero()[:,0].numpy()
+    tids = tids[tids < len(bounds) - 1]
+    if len(tids) == 0:
+        return None, None, None
+    igood = np.sort(np.concatenate([order[bounds[t]:bounds[t+1]] for t in tids]))
+    igood = torch.from_numpy(igood)
 
     if len(igood) == 0:
         return None, None, None
 
-    pid = PID[igood]
+    # Only convert IDs for the selected spikes. Copying the entire PID array
+    # on every call is especially costly when exporting one cluster at a time.
+    pid = torch.from_numpy(PID_np[igood.numpy()]).long()
     data = tF[igood]
     nspikes, nchanraw, nfeatures = data.shape
     ichan, imap = torch.unique(iC[:, ix], return_inverse=True)
     nchan = ichan.nelement()
 
     dd = torch.zeros((nspikes, nchan, nfeatures))
-    for k,j in enumerate(ix.nonzero()[:,0]):
-        ij = torch.nonzero(pid==j)[:, 0]
-        dd[ij.unsqueeze(-1), imap[:,k]] = data[ij]
+    # A channel listed twice for one template (not the case for channel
+    # maps from Kilosort's own iC) is written twice; keep the original
+    # per-template loop then, so the same write wins.
+    srt = imap.sort(0).values
+    if fastest('getdata') and not (srt[1:] == srt[:-1]).any():
+        # One scatter for all templates: the column of template k is
+        # imap[:, k], and each spike's k comes from a lookup table.
+        tsel = ix.nonzero()[:,0]
+        kpos = torch.zeros(int(tsel.max()) + 1, dtype=torch.long)
+        kpos[tsel] = torch.arange(tsel.numel())
+        cols = imap.T[kpos[pid]]
+        dd[torch.arange(nspikes).unsqueeze(-1), cols] = data
+    else:
+        for k,j in enumerate(ix.nonzero()[:,0]):
+            ij = torch.nonzero(pid==j)[:, 0]
+            dd[ij.unsqueeze(-1), imap[:,k]] = data[ij]
 
     if merge_dim:
         Xd = torch.reshape(dd, (nspikes, -1))

@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 from numba import njit
 import math
 from kilosort.CCG import compute_CCG, CCG_metrics
@@ -8,10 +9,27 @@ def count_elements(kk, iclust, my_clus, xtree):
     n2 = np.isin(iclust, my_clus[xtree[kk, 1]]).sum()
     return n1, n2
 
-def check_split(Xd, kk, xtree, iclust, my_clus):
-    ixy = np.isin(iclust, my_clus[xtree[kk, 2]])
-    iclu = iclust[ixy]
-    labels = 2*np.isin(iclu, my_clus[xtree[kk, 0]]) - 1
+def _members(iclust, labels, nlab):
+    """Same as np.isin(iclust, labels) for iclust in [0, nlab), with a
+    lookup table instead of sorting."""
+    labels = np.asarray(labels)
+    if labels.size == 0 or labels.min() < 0 or (iclust.size and iclust.min() < 0):
+        return np.isin(iclust, labels)
+    lut = np.zeros(max(nlab, int(labels.max()) + 1), bool)
+    lut[labels] = True
+    return lut[iclust]
+
+
+def check_split(Xd, kk, xtree, iclust, my_clus, ix1=None, ix2=None):
+    if ix1 is None or ix2 is None:
+        ixy = np.isin(iclust, my_clus[xtree[kk, 2]])
+        iclu = iclust[ixy]
+        labels = 2*np.isin(iclu, my_clus[xtree[kk, 0]]) - 1
+    else:
+        # The two children partition the parent. Reuse their masks while
+        # preserving the original spike order in the regression inputs.
+        ixy = ix1 | ix2
+        labels = 2*ix1[ixy] - 1
 
     Xs = Xd[ixy]
     Xs[:,-1] = 1
@@ -24,6 +42,42 @@ def check_split(Xd, kk, xtree, iclust, my_clus):
     CC = CC + .01 * np.eye(CC.shape[0])
     b = np.linalg.solve(CC, labels @ (Xs * w))
     xproj = Xs @ b
+
+    score = bimod_score(xproj)
+    return xproj, score
+
+_SPLIT_CHUNK = 2**17
+
+
+def check_split_device(Xg, ix1, ix2):
+    """`check_split` (with ix1, ix2) on the device of Xg, the features of
+    the same spikes as Xd. Same float64 arithmetic, so only the order of the
+    sums differs from the CPU version."""
+    ixy = ix1 | ix2
+    sel = torch.from_numpy(np.nonzero(ixy)[0]).to(Xg.device)
+    labels = torch.from_numpy(2*ix1[ixy] - 1).to(Xg.device, torch.float64)
+    npos = (labels > 0).double().mean()
+    nneg = (labels < 0).double().mean()
+    w = torch.where(labels > 0, nneg, npos).unsqueeze(1)
+
+    # The float64 copies of the spikes are made in chunks of rows, so that
+    # the memory stays bounded for very large clusters.
+    def rows(s):
+        Xs = Xg.index_select(0, sel[s:s+_SPLIT_CHUNK]).double()
+        Xs[:,-1] = 1
+        return Xs
+
+    nf = Xg.shape[1]
+    CC = torch.zeros((nf, nf), dtype=torch.float64, device=Xg.device)
+    rhs = torch.zeros(nf, dtype=torch.float64, device=Xg.device)
+    for s in range(0, len(sel), _SPLIT_CHUNK):
+        Xs = rows(s)
+        Xw = Xs * w[s:s+_SPLIT_CHUNK]
+        CC += Xs.T @ Xw
+        rhs += labels[s:s+_SPLIT_CHUNK] @ Xw
+    CC = CC + .01 * torch.eye(CC.shape[0], dtype=CC.dtype, device=CC.device)
+    b = torch.linalg.solve(CC, rhs)
+    xproj = torch.cat([rows(s) @ b for s in range(0, len(sel), _SPLIT_CHUNK)]).cpu().numpy()
 
     score = bimod_score(xproj)
     return xproj, score
@@ -85,36 +139,41 @@ def refractoriness(st1, st2):
         #    print('good cluster becomes bad')
     return criterion
 
-def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
+def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None,
+          Xg = None):
+    # Xg: optional copy of Xd on the GPU, used for the bimodality regression.
     xtree = np.array(xtree)
 
     kk = xtree.shape[0]-1
     nc = xtree.shape[0] + 1
     valid_merge = np.ones((nc-1,), 'bool')
+    nlab = int(iclust.max()) + 1 if iclust.size else 0
 
 
     for kk in range(nc-2,-1,-1):
         if not valid_merge[kk]:
             continue;
 
-        ix1 = np.isin(iclust, my_clus[xtree[kk, 0]])
-        ix2 = np.isin(iclust, my_clus[xtree[kk, 1]])
+        # This criterion cannot merge the node, so no spike masks or other
+        # tests are needed. The old verbose-only mask sums were unused.
+        if tstat[kk,0] < 0.2:
+            continue
+
+        ix1 = _members(iclust, my_clus[xtree[kk, 0]], nlab)
+        ix2 = _members(iclust, my_clus[xtree[kk, 1]], nlab)
 
         criterion = 0
         score = np.nan
-        if criterion==0:
-            # first mutation is global modularity
-            if tstat[kk,0] < 0.2:
-                criterion = -1
-
-
         if meta is not None and criterion==0:
             # second mutation is based on meta_data
             criterion = refractoriness(meta[ix1],meta[ix2])
             #criterion = 0
         
         if criterion==0:
-            xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
+            if Xg is not None:
+                xproj, score = check_split_device(Xg, ix1, ix2)
+            else:
+                xproj, score = check_split(Xd, kk, xtree, iclust, my_clus, ix1, ix2)
             # third mutation is bimodality
             #xproj, score = check_split(Xd, kk, xtree, iclust, my_clus)
             criterion = 2 * (score <  .6) - 1
@@ -123,11 +182,6 @@ def split(Xd, xtree, tstat, iclust, my_clus, verbose = True, meta = None):
             # fourth mutation is local modularity (not reachable)
             score = tstat[kk,-1]
             criterion = score > .15
-
-        if verbose:
-            n1,n2 = ix1.sum(), ix2.sum()
-            #print('%3.0d, %6.0d, %6.0d, %6.0d, %2.2f,%4.2f, %2.2f'%(kk, n1, n2,n1+n2,
-            #tstat[kk,0], tstat[kk,-1], score))
 
         if criterion==1:
             valid_merge[kk] = 0
@@ -155,8 +209,9 @@ def new_clusters(iclust, my_clus, xtree, tstat):
 
     ind = np.nonzero(isleaf)[0]
     iclust1 = iclust.copy()
+    nlab = int(iclust.max()) + 1 if iclust.size else 0
     for j in range(len(ind)):
-        ix = np.isin(iclust, my_clus[ind[j]])
+        ix = _members(iclust, my_clus[ind[j]], nlab)
         iclust1[ix] = j
         xtree[xtree[:,0] == ind[j], 0] = j
         xtree[xtree[:,1] == ind[j], 1] = j
