@@ -361,3 +361,26 @@ def test_backend_does_not_forward_matlab_tail_to_reference_or_svd(monkeypatch):
     monkeypatch.setattr(learn, '_get_spikes_reference', lambda *args: 'reference')
     assert learn._backend('get_spikes2', np.zeros(17), torch.zeros(1),
                           ops={'ks25': {'matlab_tail': True}}) == 'reference'
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA unavailable')
+def test_cuda_backend_matlab_tail_changes_detection_window():
+    nt, nt0 = 4096, 61
+    X = torch.zeros((1, nt), device='cuda')
+    W = torch.zeros((1, 1, nt0), device='cuda')
+    W[0, 0, 20] = -1
+    U = torch.ones((1, 1, 1), device='cuda')
+    for start in (500, nt - 200):
+        X[0, start + 20] = -12
+    mu = torch.tensor([12.], device='cuda')
+    ic = torch.zeros((1, 1), dtype=torch.int32, device='cuda')
+    iw = torch.zeros(1, dtype=torch.int32, device='cuda')
+    utu = torch.ones((1, 1), dtype=torch.bool, device='cuda')
+    ilist = torch.zeros((1, 1), dtype=torch.int32, device='cuda')
+    wpca = W[:, 0].contiguous()
+    p = np.array([nt, 1, 5, 5, nt0, 1, 1, 10, .99, 1, 1, 20, 0, 1, 1, 10, 1], dtype=np.float64)
+    args = (p, X, U, W, mu, ic, iw, utu, ilist, wpca)
+    full = learn._backend('mpnu8', *args, ops={'ks25': {'matlab_tail': False}})
+    legacy = learn._backend('mpnu8', *args, ops={'ks25': {'matlab_tail': True}})
+    assert sorted(full['st0'].cpu().tolist()) == [500, nt-200]
+    assert legacy['st0'].cpu().tolist() == [500]
