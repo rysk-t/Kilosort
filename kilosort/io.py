@@ -918,6 +918,20 @@ class BinaryRWFile:
             done.record(stream)
         return data, done, bstart, bend
 
+    def set_prefetch_order(self, order):
+        """Tell the read-ahead in which order the batches will be requested
+        (e.g. the drift-sorted order of Kilosort 2.5's learnTemplates), so it
+        reads the right batches instead of guessing a constant stride.
+        `None` goes back to guessing."""
+        pf = self.__dict__.setdefault('_prefetch', {})
+        if order is None:
+            pf.pop('order', None)
+            pf.pop('pos', None)
+            return
+        order = [int(b) * self.batch_downsampling for b in order]
+        pf['order'] = order
+        pf['pos'] = {b: i for i, b in enumerate(order)}
+
     def _prefetched_batch(self, ibatch):
         """Return the raw batch `ibatch` and start reading the next ones.
 
@@ -945,7 +959,12 @@ class BinaryRWFile:
             # e.g. the start of a new pass over the data
             step = self.batch_downsampling
         pf['last'] = ibatch
-        ahead = [ibatch + k*step for k in range(1, _prefetch_depth() + 1)]
+        pos = pf.get('pos')
+        if pos is not None and ibatch in pos:
+            i = pos[ibatch]
+            ahead = pf['order'][i + 1:i + 1 + _prefetch_depth()]
+        else:
+            ahead = [ibatch + k*step for k in range(1, _prefetch_depth() + 1)]
         ahead = [b for b in ahead if b // self.batch_downsampling < self.n_batches]
         for b in list(pending):
             if b not in ahead:
