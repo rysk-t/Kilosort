@@ -401,6 +401,11 @@ void svd_getW(ptr_t pwtw, ptr_t pW, int Nfilt, int tmax)
     for (int k = 0; k < NRANK; ++k)
         sW[tid + k * NT0] = W[tid + bid * NT0 + (long long)k * NT0 * Nfilt];
     __syncthreads();
+    // 100 power iterations per component, as the original. Once an
+    // iteration leaves the vector bitwise unchanged, every later iteration
+    // would reproduce it (and the same x), so the loop stops there with the
+    // same result.
+    __shared__ double sX[NT0];
     double x = 0.0;
     for (int k = 0; k < NRANK; ++k) {
         for (int i = 0; i < 100; ++i) {
@@ -408,16 +413,18 @@ void svd_getW(ptr_t pwtw, ptr_t pW, int Nfilt, int tmax)
             for (int t = 0; t < NT0; ++t) x += swtw[tid + t * NT0] * sW[t + k * NT0];
             __syncthreads();
             if (i < 99) {
-                sW[tid + k * NT0] = x;
+                sX[tid] = x;
                 __syncthreads();
                 if (tid == 0) {
                     double x0 = 0.00001f;
-                    for (int t = 0; t < NT0; ++t) x0 += sW[t + k * NT0] * sW[t + k * NT0];
+                    for (int t = 0; t < NT0; ++t) x0 += sX[t] * sX[t];
                     xN = sqrt(x0);
                 }
                 __syncthreads();
-                sW[tid + k * NT0] = x / xN;
-                __syncthreads();
+                double wn = x / xN;
+                bool same = (wn == sW[tid + k * NT0]);
+                sW[tid + k * NT0] = wn;
+                if (__syncthreads_and(same)) break;
             }
         }
         for (int t = 0; t < NT0; ++t) swtw[tid + t * NT0] -= sW[t + k * NT0] * x;
@@ -777,6 +784,8 @@ __device__ __forceinline__ void overlapping(const bool* UtU, int f, int Nfilt, i
 // in [st, st + NT0), one time point of data per value).
 // dynamic shared memory: win[MAXSLOTS * NT0] floats, slot[Nchan] ints,
 // chan_of[MAXSLOTS] ints, mlist[Nfilt] ints, counters.
+#define TRS 4
+#define NTS ((NT0 + TRS - 1) / TRS)
 #define SPACE_FILTER_UPDATE(NAME, T)                                                            \
 extern "C" __global__                                                                           \
 void NAME(ptr_t pdata, ptr_t pU, ptr_t pUtU, ptr_t piC, ptr_t piW, ptr_t pdprod,                \
@@ -823,23 +832,42 @@ void NAME(ptr_t pdata, ptr_t pU, ptr_t pUtU, ptr_t piC, ptr_t piW, ptr_t pdprod,
             }                                                                                   \
         }                                                                                       \
         __syncthreads();                                                                        \
-        for (int i = tid; i < m * NT0; i += blockDim.x) {                                       \
-            int j = i / NT0, t = i - j * NT0;                                                   \
+        /* thread per (template, TRS consecutive time points) */                               \
+        for (int i = tid; i < m * NTS; i += blockDim.x) {                                       \
+            int j = i / NTS, t0 = (i - j * NTS) * TRS;                                          \
             int bid = mlist[j];                                                                 \
-            if (s + t >= NT) continue;                                                          \
             const int* row = iC + NCHANU * iW[bid];                                             \
             const float* u = U + Nchan * bid;                                                   \
-            float x[NRANK];                                                                     \
+            float x[NRANK][TRS];                                                                \
             _Pragma("unroll")                                                                   \
-            for (int k = 0; k < NRANK; ++k) x[k] = 0.0f;                                        \
+            for (int k = 0; k < NRANK; ++k)                                                     \
+                _Pragma("unroll")                                                               \
+                for (int r = 0; r < TRS; ++r) x[k][r] = 0.0f;                                   \
             for (int i2 = 0; i2 < NCHANU; ++i2) {                                               \
                 int c = row[i2];                                                                \
-                float d = gathered ? win[slot[c] * NT0 + t] : (float)(data[s + t + (long long)NT * c]); \
+                float uk[NRANK];                                                                \
                 _Pragma("unroll")                                                               \
-                for (int k = 0; k < NRANK; ++k) x[k] += u[c + (long long)Nchan * Nfilt * k] * d; \
+                for (int k = 0; k < NRANK; ++k) uk[k] = u[c + (long long)Nchan * Nfilt * k];    \
+                const float* wrow = win + slot[c] * NT0;                                        \
+                _Pragma("unroll")                                                               \
+                for (int r = 0; r < TRS; ++r) {                                                 \
+                    int t = t0 + r;                                                             \
+                    float d = 0.0f;                                                             \
+                    if (t < NT0 && s + t < NT)                                                  \
+                        d = gathered ? wrow[t] : (float)(data[s + t + (long long)NT * c]);      \
+                    _Pragma("unroll")                                                           \
+                    for (int k = 0; k < NRANK; ++k) x[k][r] += uk[k] * d;                       \
+                }                                                                               \
             }                                                                                   \
             _Pragma("unroll")                                                                   \
-            for (int k = 0; k < NRANK; ++k) dprod[s + t + (long long)NT * (bid + k * Nfilt)] = x[k]; \
+            for (int r = 0; r < TRS; ++r) {                                                     \
+                int t = t0 + r;                                                                 \
+                if (t < NT0 && s + t < NT) {                                                    \
+                    _Pragma("unroll")                                                           \
+                    for (int k = 0; k < NRANK; ++k)                                             \
+                        dprod[s + t + (long long)NT * (bid + k * Nfilt)] = x[k][r];             \
+                }                                                                               \
+            }                                                                                   \
         }                                                                                       \
     }                                                                                           \
 }
@@ -902,13 +930,21 @@ mp_time_filter(ptr_t pdprod, ptr_t pW, ptr_t pdout, int NT, int Nfilt, int Tend)
 }
 
 // timeFilterUpdate: dout of the overlapping templates at [st - NT0, st + NT0)
-// (block per spike, one half-warp per template, each lane computes TR
-// consecutive outputs with a sliding register window of the template: one
-// load of the data row and one (broadcast) load of the template per step;
-// the terms of each output are accumulated in the original order).
-// dynamic shared memory: mlist[Nfilt] ints + counter.
+// (block per spike, one half-warp per template). The half-warp first
+// stages the window [st - NT0, st + 2 NT0 - 1) of the template's NRANK
+// dprod rows in shared memory (coalesced, padded so the strided reads below
+// are bank-conflict free); each lane then computes TR consecutive outputs
+// with a sliding register window of the template: one shared load of the
+// data and one (broadcast) load of the template per step; the terms of
+// each output are accumulated in the original order.
+// dynamic shared memory: mlist[Nfilt] ints + counter + NHALF * NRANK * TWP floats.
 #define TR 8
-extern "C" __global__ void __launch_bounds__(TPB)
+#define TPT 256
+#define NHALF (TPT / 16)
+#define TW (3 * NT0 - 1)
+#define TWP (TW + TW / 32 + 1)
+#define PADQ(q) ((q) + ((q) >> 5))
+extern "C" __global__ void __launch_bounds__(TPT)
 mp_time_filter_update(ptr_t pdprod, ptr_t pW, ptr_t pUtU, ptr_t pdout, ptr_t pst, ptr_t pid,
                       ptr_t pcounter, int NT, int Nfilt, int maxFR)
 {
@@ -921,7 +957,10 @@ mp_time_filter_update(ptr_t pdprod, ptr_t pW, ptr_t pUtU, ptr_t pdout, ptr_t pst
     const int* counter = (const int*)pcounter;
     extern __shared__ int mlist[];
     int* nm = mlist + Nfilt;
-    const int tid = threadIdx.x, lane = tid & 15, half = tid >> 4, nhalf = blockDim.x >> 4;
+    float* sbuf = (float*)(nm + 1);
+    const int tid = threadIdx.x, lane = tid & 15, half = tid >> 4;
+    const unsigned mask = (tid & 16) ? 0xffff0000u : 0x0000ffffu;
+    float* my = sbuf + half * NRANK * TWP;
     const int n1 = counter[1], n0 = min(counter[0], maxFR);
     for (int ind = n1 + blockIdx.x; ind < n0; ind += gridDim.x) {
         const int s = st[ind], f = id[ind];
@@ -931,15 +970,27 @@ mp_time_filter_update(ptr_t pdprod, ptr_t pW, ptr_t pUtU, ptr_t pdout, ptr_t pst
         overlapping(UtU, f, Nfilt, mlist, nm);
         __syncthreads();
         const int m = *nm;
-        for (int j = half; j < m; j += nhalf) {
+        for (int j = half; j < m; j += NHALF) {
             const int bid = mlist[j];
-            const int base = s - NT0 + lane * TR;  // outputs base .. base + TR - 1
+            // all the staging loads in flight at once (unrolled: TW is a constant)
+            #pragma unroll
+            for (int k = 0; k < NRANK; ++k) {
+                const float* src = dprod + (long long)NT * (bid + (long long)Nfilt * k);
+                #pragma unroll
+                for (int q0 = 0; q0 < TW; q0 += 16) {
+                    int q = q0 + lane;
+                    int tt = s - NT0 + q;
+                    if (q < TW) my[k * TWP + PADQ(q)] = (tt >= 0 && tt < NT) ? src[tt] : 0.0f;
+                }
+            }
+            __syncwarp(mask);
+            const int base = lane * TR;  // outputs s - NT0 + base .. + TR - 1
             float x[TR];
             #pragma unroll
             for (int jj = 0; jj < TR; ++jj) x[jj] = 0.0f;
             for (int k = 0; k < NRANK; ++k) {
-                const float* src = dprod + (long long)NT * (bid + (long long)Nfilt * k);
                 const float* w = W + NT0 * (bid + (long long)Nfilt * k);
+                const float* d = my + k * TWP;
                 float wv[TR];
                 #pragma unroll
                 for (int jj = 0; jj < TR; ++jj) wv[jj] = 0.0f;
@@ -948,17 +999,18 @@ mp_time_filter_update(ptr_t pdprod, ptr_t pW, ptr_t pUtU, ptr_t pdout, ptr_t pst
                     #pragma unroll
                     for (int jj = TR - 1; jj > 0; --jj) wv[jj] = wv[jj - 1];
                     wv[0] = (t < NT0) ? w[t] : 0.0f;
-                    int tt = base + t;
-                    float dv = (tt >= 0 && tt < NT) ? src[tt] : 0.0f;
+                    int q = base + t;
+                    float dv = (q < TW) ? d[PADQ(q)] : 0.0f;
                     #pragma unroll
                     for (int jj = 0; jj < TR; ++jj)
                         if (t - jj >= 0 && t - jj < NT0) x[jj] += wv[jj] * dv;
                 }
             }
+            __syncwarp(mask);
             #pragma unroll
             for (int jj = 0; jj < TR; ++jj) {
-                int tid0 = base + jj;
-                if (lane * TR + jj < NLAG && tid0 >= 0 && tid0 < NT - NT0)
+                int tid0 = s - NT0 + base + jj;
+                if (base + jj < NLAG && tid0 >= 0 && tid0 < NT - NT0)
                     dout[tid0 + (long long)NT * bid] = x[jj];
             }
         }
@@ -1497,7 +1549,8 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
         # there are at most about NT / nt0 of them: one block each
         gspk = max(1, min(4096, NT // nt0 + 1))
         smem_sfu = 4 * (MAXSLOTS * nt0 + Nchan + MAXSLOTS + Nfilt + 2)
-        smem_tfu = 4 * (Nfilt + 1)
+        twp = (3 * nt0 - 1) + (3 * nt0 - 1) // 32 + 1
+        smem_tfu = 4 * (Nfilt + 1) + 4 * (256 // 16) * Nrank * twp
         smem_bfu = 4 * (3 * Nfilt + 32 + 1 + 32 + 1) + Nfilt + 16
         sfu.max_dynamic_shared_size_bytes = smem_sfu
         tfu.max_dynamic_shared_size_bytes = smem_tfu
@@ -1523,7 +1576,7 @@ def mpnu8(Params, X, U, W, mu, iC, iW, UtU, iList, wPCA, maxFR=100000,
             sfu((gspk,), (TPB,),
                 (_p(data_sub), _p(U), _p(UtU), _p(iC), _p(iW), _p(dprod), _p(st), _p(sid), _p(counter),
                  *_i32(NT, Nfilt, Nchan, maxFR)), shared_mem=smem_sfu)
-            tfu((gspk,), (TPB,),
+            tfu((gspk,), (256,),
                 (_p(dprod), _p(W), _p(UtU), _p(dout), _p(st), _p(sid), _p(counter), *_i32(NT, Nfilt, maxFR)),
                 shared_mem=smem_tfu)
             bfu((gspk,), (TPB,),
