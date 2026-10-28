@@ -3,7 +3,7 @@ from numba.types import bool_
 import numpy as np
 import torch
 
-from kilosort.clustering_qr import xy_templates, get_data_cpu, _template_groups
+from kilosort.clustering_qr import xy_templates, get_data_cpu
 
 
 @njit("(int64[:], int32[:], int32)", cache=True)
@@ -112,20 +112,24 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
     csorted = spike_clusters[corder]
     starts = np.searchsorted(csorted, clusters, side='left')
     ends = np.searchsorted(csorted, clusters, side='right')
-    template_groups = _template_groups(spike_templates)
 
     for i, cs, ce in zip(clusters, starts, ends):
+        # Only this cluster's spikes are read and overwritten. Spikes detected
+        # with one template are often split across several final clusters, so
+        # selecting spikes by template would rank channels on other clusters'
+        # spikes and re-read rows that an earlier cluster already reordered.
+        isp = torch.from_numpy(corder[cs:ce])
+        pid = spike_templates[isp.numpy()]
         # Get templates associated with cluster (often just 1)
-        iunq = np.unique(spike_templates[corder[cs:ce]]).astype(int)
+        iunq = np.unique(pid).astype(int)
         # Get boolean mask with size (n_templates,), True if they match cluster
         ix = torch.from_numpy(np.zeros(n_templates, bool))
         ix[iunq] = True
-        # Get PC features for all spikes detected with those templates (Xd),
-        # and the indices in tF where those spikes occur (igood).
+        # Get PC features for the cluster's spikes (Xd), and the indices
+        # of those spikes within isp (igood).
         Xd, igood, ichan = get_data_cpu(
-            ops, xy, iC, spike_templates, tF, None, None,
-            dmin=ops['dmin'], dminx=ops['dminx'], ix=ix, merge_dim=False,
-            _groups=template_groups
+            ops, xy, iC, pid, tF[isp], None, None,
+            dmin=ops['dmin'], dminx=ops['dminx'], ix=ix, merge_dim=False
             )
 
         # Take mean of features across spikes, find channels w/ largest norm
@@ -133,7 +137,7 @@ def make_pc_features(ops, spike_templates, spike_clusters, tF):
         chan_norm = torch.linalg.norm(spike_mean, dim=1)
         sorted_chans, ind = torch.sort(chan_norm, descending=True)
         # Assign features to overwrite tF in-place
-        tF[igood,:] = Xd[:, ind[:n_chans], :]
+        tF[isp[igood],:] = Xd[:, ind[:n_chans], :]
         # Save channel inds for phy
         feature_ind[i,:] = ichan[ind[:n_chans]].cpu().numpy()
 
