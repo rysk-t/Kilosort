@@ -46,3 +46,48 @@ def test_run_kilosort25_zfm_phy_outputs(gpu, request, tmp_path):
     assert len(rez['st3']) == len(times)
     assert ops['n_chan_bin'] == 385
     assert np.load(output / 'ops.npy', allow_pickle=True).item()['n_chan_bin'] == 385
+
+
+class _StopAfterInit(Exception):
+    pass
+
+
+def _nblocks_used(monkeypatch, tmp_path, n_chan, settings):
+    """Run `run_kilosort25` up to `initialize_ops` and return the nblocks it gets."""
+    import kilosort.ks25.run as run25
+    probe = {'chanMap': np.arange(n_chan), 'xc': np.zeros(n_chan),
+             'yc': np.arange(n_chan, dtype=float) * 20, 'kcoords': np.zeros(n_chan),
+             'n_chan': n_chan}
+    binary = tmp_path / 'data.bin'
+    np.zeros((1000, n_chan), dtype='int16').tofile(binary)
+    seen = {}
+
+    def fake_initialize_ops(settings, *args, **kwargs):
+        seen['nblocks'] = settings['nblocks']
+        raise _StopAfterInit
+
+    monkeypatch.setattr(run25, 'initialize_ops', fake_initialize_ops)
+    with pytest.raises(_StopAfterInit):
+        run25.run_kilosort25(settings={'n_chan_bin': n_chan, **settings}, filename=binary,
+                             probe=probe, results_dir=tmp_path / 'out', device=__import__('torch').device('cpu'),
+                             drift_plots=False)
+    return seen['nblocks']
+
+
+def test_default_nblocks_rule():
+    from kilosort.ks25.run import default_nblocks
+    assert default_nblocks(384) == 5
+    assert default_nblocks(33) == 5
+    assert default_nblocks(32) == 1
+    assert default_nblocks(16) == 1
+
+
+@pytest.mark.parametrize('n_chan, settings, expected', [
+    (64, {}, 5),                         # KS2.5 default (configFile384.m)
+    (32, {}, 1),                         # small probe: rigid registration
+    (64, {'preset': 'tuned'}, 5),        # the tuned preset keeps the default
+    (64, {'nblocks': 1}, 1),             # explicit value wins
+    (16, {'nblocks': 3}, 3),             # explicit value wins on small probes too
+])
+def test_run_kilosort25_nblocks_default(monkeypatch, tmp_path, n_chan, settings, expected):
+    assert _nblocks_used(monkeypatch, tmp_path, n_chan, settings) == expected

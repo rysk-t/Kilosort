@@ -44,6 +44,19 @@ def split_settings(settings):
     return s4, s25
 
 
+# configFile384.m uses ops.nblocks = 5. Non-rigid blocks need enough channels
+# along the probe, so small probes (<= SMALL_PROBE_CHANNELS) fall back to
+# rigid registration. An explicit `nblocks` in `settings` always wins.
+NBLOCKS_KS25 = 5
+SMALL_PROBE_CHANNELS = 32
+
+
+def default_nblocks(n_chan):
+    """KS2.5 default for `nblocks`: 5, or 1 (rigid) for probes with at most
+    `SMALL_PROBE_CHANNELS` channels."""
+    return 1 if n_chan <= SMALL_PROBE_CHANNELS else NBLOCKS_KS25
+
+
 def batch_order(ops):
     """`rez.iorig` of datashift2: batches sorted by their mean drift."""
     dshift = ops.get('dshift', None)
@@ -72,12 +85,15 @@ def run_kilosort25(settings, probe=None, probe_name=None, filename=None,
     rez : dict
         The MATLAB `rez` structure (st3, cProj, cProjPC, W, U, mu, dWU, ...).
     """
+    explicit_nblocks = 'nblocks' in settings
     settings, settings25 = split_settings(settings)
     if settings.get('n_chan_bin') is None:
         raise ValueError('`n_chan_bin` must be specified in settings')
     filename, data_dir, results_dir, probe = set_files(
         settings, filename, probe, probe_name, data_dir, results_dir,
         bad_channels, shank_idx)
+    if not explicit_nblocks:
+        settings['nblocks'] = default_nblocks(int(probe['n_chan']))
     setup_logger(results_dir, verbose_console)
     background_plots = []
     try:
